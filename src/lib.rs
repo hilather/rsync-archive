@@ -20,8 +20,9 @@ pub use pipeline::{
     cleanup_partial, commit_output, output_exists, partial_path_for, prepare_output, OutputPaths,
 };
 pub use select::{
-    archive_name_for, collect_from_files_from, collect_from_sources, load_exclude_from,
-    load_filter_from, load_include_from, parse_rule, Rule, RuleAction, RuleSet, SelectedEntry,
+    apply_dir_budgets, archive_name_for, collect_from_files_from, collect_from_sources,
+    load_exclude_from, load_filter_from, load_include_from, parse_dir_budgets,
+    parse_dir_max_size_arg, parse_rule, DirBudget, Rule, RuleAction, RuleSet, SelectedEntry,
     SelectionStats, SourceKind, SourceSpec,
 };
 

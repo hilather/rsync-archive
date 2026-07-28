@@ -303,6 +303,30 @@ Automated: `tests/filter_parity.rs` (extends this table).
 
 ---
 
+## Directory size budgets (`--dir-max-size`)
+
+After normal include/exclude selection (and collision checks), optional per-directory
+**byte budgets** cap how much is selected under a given archive-relative directory.
+
+| Flag | Format | Example |
+|------|--------|---------|
+| `--dir-max-size` (repeatable) | `PATH=SIZE` | `--dir-max-size logs/=100M` |
+
+- **PATH** — archive-relative directory prefix (trailing `/` optional; normalized like member paths; no `..`).
+- **SIZE** — same syntax as encode budgets (`100M`, `1G`, `500K`, raw bytes).
+- **Order of operations:** rsync filters first → budget post-process on the candidate list.
+- **Scope:** recursive regular files whose `archive_name` is under `PATH/` (not a file named exactly `PATH`).
+- **Ordering:** under each budget, sort by **mtime descending**, then `archive_name` ascending.
+- **Accumulation:** include while `running_sum + size ≤ limit`; further files are **budget-skips** (not rsync excludes).
+- **Nesting:** if multiple budgets match a file, the **longest matching prefix** wins; budgets apply independently per group.
+- **Logging:** each budget-skip is logged at warn with path, size, mtime, budget dir/limit, running sum.
+- **Counters:** `SelectionStats.skipped_dir_budget`.
+- **Dry-run:** same `build_selection` path as write.
+
+Implementation: `src/select/dir_budget.rs`.
+
+---
+
 ## Defaults checklist (must stay accurate)
 
 | Topic | Rule |
@@ -316,3 +340,4 @@ Automated: `tests/filter_parity.rs` (extends this table).
 | `**` | across segments |
 | Filter file caps | 10 MiB / 1M lines |
 | Merge / dir-merge | **not** implemented |
+| Dir size budgets | newest-mtime-first; longest prefix; post-filter |

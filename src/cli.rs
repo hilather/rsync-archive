@@ -95,6 +95,15 @@ pub struct CreateArgs {
     #[arg(long = "encode-size-budget", default_value = "500M")]
     pub encode_size_budget: String,
 
+    /// Cap total selected bytes under an archive-relative directory (repeatable).
+    ///
+    /// Format: `PATH=SIZE` (e.g. `logs/=100M`, `cache=50M`). After normal filters,
+    /// files under `PATH` are considered newest-mtime-first; further files that
+    /// would exceed the budget are skipped (counted as dir-budget skips).
+    /// Nested budgets: longest matching prefix wins.
+    #[arg(long = "dir-max-size", value_name = "PATH=SIZE", action = clap::ArgAction::Append)]
+    pub dir_max_size: Vec<String>,
+
     /// After write, list/test the archive.
     #[arg(long = "verify")]
     pub verify: bool,

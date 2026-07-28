@@ -152,3 +152,37 @@ fn dry_run_does_not_write_output() {
     assert!(!out.exists());
     assert!(!dir.path().join("out.7z.partial").exists());
 }
+
+#[test]
+fn dry_run_dir_budget_excludes_older_files() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("tree");
+    fs::create_dir_all(root.join("logs")).unwrap();
+    let old = root.join("logs/old.bin");
+    let new = root.join("logs/new.bin");
+    let keep = root.join("root.txt");
+    fs::write(&old, vec![0u8; 20]).unwrap();
+    fs::write(&new, vec![0u8; 20]).unwrap();
+    fs::write(&keep, b"keep").unwrap();
+    filetime::set_file_mtime(&old, filetime::FileTime::from_unix_time(100, 0)).unwrap();
+    filetime::set_file_mtime(&new, filetime::FileTime::from_unix_time(300, 0)).unwrap();
+
+    let src = format!("{}/", root.display());
+    bin()
+        .args([
+            "create",
+            "-o",
+            dir.path().join("out.7z").to_str().unwrap(),
+            "-n",
+            "--dir-max-size",
+            "logs/=25",
+            &src,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("logs/new.bin"))
+        .stdout(predicate::str::contains("root.txt"))
+        .stdout(predicate::str::contains("old.bin").not())
+        .stderr(predicate::str::contains("dir-budget skipped"));
+    assert!(!dir.path().join("out.7z").exists());
+}

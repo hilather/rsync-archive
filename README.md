@@ -73,6 +73,7 @@ rsync-archive create -o game.7z \
 
 rsync-archive create -o out.7z --files-from list.txt --dry-run
 rsync-archive create -o out.7z --force --level 1 /data/tree
+rsync-archive create -o o.7z --dir-max-size logs/=100M --dir-max-size cache=50M tree/
 ```
 
 **Write model:** non-solid 7z, **per-file packs** (file-level random access):
@@ -85,11 +86,12 @@ rsync-archive create -o out.7z --force --level 1 /data/tree
 
 Empty files use empty flags; mtime from source; `OUT.partial` → rename. Parallel encode: AC-style workers + **500M** budget.
 
-**Still backlog:** true single-stream **seekable-zstd** (zeekstd) for tar-like blobs; dir size budgets — [`docs/BACKLOG.md`](docs/BACKLOG.md).
+**Still backlog:** true single-stream **seekable-zstd** (zeekstd) for tar-like blobs — [`docs/BACKLOG.md`](docs/BACKLOG.md).
 
 **Trailing `/` on SRC** strips the directory name from archive paths (`photos/` → `a.jpg`; `photos` → `photos/a.jpg`).  
 **`--files-from`:** exclusive of `SRC...`; relative lines keep path as member name; absolute lines use basename.  
-**Filters:** see [`docs/SELECTION.md`](docs/SELECTION.md). Rule build order: include-from → exclude-from → `--filter` → `--include` → `--exclude` (use `--filter` for strict interleaving).
+**Filters:** see [`docs/SELECTION.md`](docs/SELECTION.md). Rule build order: include-from → exclude-from → `--filter` → `--include` → `--exclude` (use `--filter` for strict interleaving).  
+**`--dir-max-size PATH=SIZE`:** after filters, cap total selected bytes under an archive-relative directory (newest mtime first; nested → longest prefix).
 
 ### `embed` (Stage 3 — implemented)
 
@@ -128,6 +130,7 @@ Default naming flattens to **basename**. Missing 7z magic **warns** (stderr log)
 | `--threads` | auto | Encode workers (omit = auto: many tiny files → 1, else CPUs) |
 | `--encode-concurrency` | `0` | Max concurrent encodes (`0` = auto from threads) |
 | `--encode-size-budget` | `500M` | Max in-flight uncompressed size (`0` = unlimited) |
+| `--dir-max-size` | — | Cap selected bytes under archive-relative dir (`PATH=SIZE`, repeatable; newest-first) |
 | `--verify` | off | Post-write test |
 | `SRC...` | — | Sources (required unless `--files-from`) |
 
@@ -167,7 +170,7 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for stages and PR plan.
 | 7 Verify + acceptance | Planned |
 | Codec: Zstd + LZ4 in 7z | **Done** — `--method zstd|lz4` (file-level RA) |
 | True seekable-zstd stream (zeekstd) | **Backlog** — single-blob tar-like |
-| 9+ Directory size budgets (newest-first) | **Backlog** — [`docs/BACKLOG.md`](docs/BACKLOG.md) |
+| 9 Directory size budgets (newest-first) | **Done** — `--dir-max-size PATH=SIZE` (post-filter; longest prefix) |
 ---
 
 ## Project layout

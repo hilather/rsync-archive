@@ -97,6 +97,7 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | Encode threads | **auto** (omit `--threads`; many tiny files → 1) |
 | Encode concurrency | **0** → auto from threads |
 | Encode size budget | **500M** in-flight uncompressed (like archiveconverter nested budget) |
+| Dir size budgets | `--dir-max-size PATH=SIZE` (optional); newest-mtime-first; longest prefix wins |
 | Embed method | **Copy** `0x00` (store), no recompress |
 | Embed naming | **Basename flatten** unless `--keep-path` |
 | Overwrite | **Error** if `-o` exists unless `--force` |
@@ -122,6 +123,7 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | `src/select/matcher.rs` | Path match, `action_for`, `should_prune_dir` |
 | `src/select/from_file.rs` | include-from / exclude-from / filter files; size/line caps |
 | `src/select/walk.rs` | SRC walk + `--files-from` → `SelectedEntry`; prune; collisions |
+| `src/select/dir_budget.rs` | `--dir-max-size` newest-first directory byte budgets |
 | `src/pipeline/output.rs` | `*.partial` naming, `--force` check, rename commit |
 | `src/pipeline/create.rs` | **`create` selection + LZMA2 write** (partial+rename, verify) |
 | `src/archive/sevenz/lzma2_writer.rs` | `NonsolidLzma2Writer` — non-solid create packs |
@@ -134,7 +136,7 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | `src/pipeline/embed.rs` | **`embed` command** — naming, magic, store write, verify |
 | `docs/DESIGN.md` | Full design (stages, decisions) |
 | `docs/SELECTION.md` | **Filter semantics source of truth** (Stage 4 frozen v1; keep in sync with `src/select/`) |
-| `docs/BACKLOG.md` | Product feature backlog (Zstd/LZ4, dir budgets, …) |
+| `docs/BACKLOG.md` | Product feature backlog (seekable-zstd, …) |
 | `src/util/auto_threads.rs` | AC-style auto workers (tiny-file → 1) |
 | `src/util/size_parse.rs` | `500M` budget parse + admit helper |
 | `tests/` | e2e and parity (`cli_smoke`, `filter_parity`) |

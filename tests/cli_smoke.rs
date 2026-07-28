@@ -30,6 +30,7 @@ fn create_help_shows_key_flags() {
         .stdout(predicate::str::contains("--level"))
         .stdout(predicate::str::contains("--threads"))
         .stdout(predicate::str::contains("--encode-size-budget"))
+        .stdout(predicate::str::contains("--dir-max-size"))
         .stdout(predicate::str::contains("--method"));
 }
 
@@ -174,6 +175,7 @@ fn create_validate_unit_rejects_both_modes() {
         threads: None,
         encode_concurrency: 0,
         encode_size_budget: "500M".into(),
+        dir_max_size: vec![],
         verify: false,
         sources: vec!["src".into()],
     };
@@ -200,6 +202,7 @@ fn create_validate_unit_accepts_sources_only() {
         threads: None,
         encode_concurrency: 0,
         encode_size_budget: "500M".into(),
+        dir_max_size: vec![],
         verify: false,
         sources: vec!["src".into()],
     };

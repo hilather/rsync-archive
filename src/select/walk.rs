@@ -31,6 +31,8 @@ pub struct SelectionStats {
     pub skipped_symlinks: u64,
     pub skipped_special: u64,
     pub skipped_excluded: u64,
+    /// Files dropped solely because a `--dir-max-size` budget was exhausted.
+    pub skipped_dir_budget: u64,
 }
 
 /// Collect selected entries from SRC walk mode.

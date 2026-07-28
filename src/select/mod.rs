@@ -2,12 +2,17 @@
 //!
 //! Filter semantics: [`docs/SELECTION.md`](../../docs/SELECTION.md).
 
+pub mod dir_budget;
 pub mod from_file;
 pub mod matcher;
 pub mod pathnorm;
 pub mod rules;
 pub mod walk;
 
+pub use dir_budget::{
+    apply_dir_budgets, is_under_budget_dir, normalize_budget_prefix, parse_dir_budgets,
+    parse_dir_max_size_arg, DirBudget,
+};
 pub use from_file::{
     load_exclude_from, load_filter_from, load_include_from, read_capped_lines,
     read_capped_lines_from_reader, MAX_FILTER_FILE_BYTES, MAX_FILTER_FILE_LINES,

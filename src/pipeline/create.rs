@@ -12,6 +12,7 @@ use crate::archive::NonsolidLzma2Writer;
 use crate::cli::CreateArgs;
 use crate::error::{Error, Result};
 use crate::pipeline::output::{cleanup_partial, commit_output, prepare_output};
+use crate::select::dir_budget::{apply_dir_budgets, parse_dir_budgets};
 use crate::select::from_file::{load_exclude_from, load_include_from};
 use crate::select::walk::{
     collect_from_files_from, collect_from_sources, SelectedEntry, SelectionStats,
@@ -58,18 +59,22 @@ pub fn build_rules(args: &CreateArgs) -> Result<RuleSet> {
 
 /// Build the full selection (same path for dry-run and write).
 ///
-/// Performs collision pre-scan inside collectors (K29).
+/// Performs collision pre-scan inside collectors (K29), then applies
+/// `--dir-max-size` budgets (newest-first) when configured.
 pub fn build_selection(args: &CreateArgs) -> Result<(Vec<SelectedEntry>, SelectionStats)> {
     let rules = build_rules(args)?;
-    if let Some(list) = &args.files_from {
-        collect_from_files_from(list, &rules)
+    let (entries, mut stats) = if let Some(list) = &args.files_from {
+        collect_from_files_from(list, &rules)?
     } else {
         let mut specs = Vec::with_capacity(args.sources.len());
         for s in &args.sources {
             specs.push(SourceSpec::from_user_path(s)?);
         }
-        collect_from_sources(&specs, &rules)
-    }
+        collect_from_sources(&specs, &rules)?
+    };
+    let budgets = parse_dir_budgets(&args.dir_max_size)?;
+    let entries = apply_dir_budgets(entries, &budgets, &mut stats)?;
+    Ok((entries, stats))
 }
 
 /// Run `rsync-archive create`.
@@ -87,6 +92,7 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
         info!(
             selected = stats.selected,
             skipped_excluded = stats.skipped_excluded,
+            skipped_dir_budget = stats.skipped_dir_budget,
             skipped_symlinks = stats.skipped_symlinks,
             skipped_special = stats.skipped_special,
             "create dry-run complete"
@@ -344,9 +350,10 @@ fn verify_create_archive(path: &Path, expected_files: usize) -> Result<()> {
 fn print_selection_summary(stats: &SelectionStats, dry_run: bool) {
     let mode = if dry_run { "dry-run" } else { "create" };
     eprintln!(
-        "{mode}: {} selected, {} excluded, {} symlinks skipped, {} special skipped",
+        "{mode}: {} selected, {} excluded, {} dir-budget skipped, {} symlinks skipped, {} special skipped",
         stats.selected,
         stats.skipped_excluded,
+        stats.skipped_dir_budget,
         stats.skipped_symlinks,
         stats.skipped_special
     );
@@ -381,6 +388,7 @@ pub(crate) fn test_create_args(
         threads: Some(1),
         encode_concurrency: 1,
         encode_size_budget: "500M".into(),
+        dir_max_size: vec![],
         verify: false,
         sources,
     }
@@ -535,5 +543,101 @@ mod tests {
         assert!(entries.iter().any(|n| n == "out.7z"));
         assert!(entries.iter().any(|n| n == "src"));
         assert_eq!(entries.len(), 2, "unexpected siblings: {entries:?}");
+    }
+
+    fn set_mtime(path: &std::path::Path, secs: i64) {
+        let ft = filetime::FileTime::from_unix_time(secs, 0);
+        filetime::set_file_mtime(path, ft).unwrap();
+    }
+
+    #[test]
+    fn dir_budget_newest_first_dry_run_and_write_match() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("tree");
+        fs::create_dir_all(root.join("logs")).unwrap();
+        fs::create_dir_all(root.join("other")).unwrap();
+        let old = root.join("logs/old.bin");
+        let mid = root.join("logs/mid.bin");
+        let new = root.join("logs/new.bin");
+        let keep = root.join("other/keep.txt");
+        fs::write(&old, vec![0u8; 10]).unwrap();
+        fs::write(&mid, vec![0u8; 20]).unwrap();
+        fs::write(&new, vec![0u8; 30]).unwrap();
+        fs::write(&keep, b"ok").unwrap();
+        set_mtime(&old, 100);
+        set_mtime(&mid, 200);
+        set_mtime(&new, 300);
+        set_mtime(&keep, 50);
+
+        let src = format!("{}/", root.display());
+        let mut args = test_create_args(dir.path().join("out.7z"), vec![src.clone()]);
+        args.dir_max_size = vec!["logs/=35".into()];
+        args.dry_run = true;
+
+        let (dry_entries, stats) = build_selection(&args).unwrap();
+        let dry_names: std::collections::HashSet<_> = dry_entries
+            .iter()
+            .map(|e| e.archive_name.as_str())
+            .collect();
+        assert_eq!(
+            dry_names,
+            ["logs/new.bin", "other/keep.txt"].into_iter().collect()
+        );
+        assert_eq!(stats.skipped_dir_budget, 2);
+
+        // Write path must use the same selection.
+        let out = dir.path().join("budget.7z");
+        let mut write_args = test_create_args(out.clone(), vec![src]);
+        write_args.dir_max_size = vec!["logs/=35".into()];
+        write_args.dry_run = false;
+        write_args.level = 1;
+        write_args.verify = true;
+        write_args.threads = Some(1);
+        run_create(write_args).unwrap();
+
+        let mut reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+        assert!(!reader.archive().is_solid);
+        let members: Vec<String> = reader
+            .archive()
+            .files
+            .iter()
+            .filter(|e| !e.is_directory())
+            .map(|e| e.name().to_string())
+            .collect();
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().any(|n| n == "logs/new.bin"));
+        assert!(members.iter().any(|n| n == "other/keep.txt"));
+        assert!(!members.iter().any(|n| n.contains("old.bin") || n.contains("mid.bin")));
+        assert_eq!(reader.read_file("logs/new.bin").unwrap().len(), 30);
+    }
+
+    #[test]
+    fn dir_budget_nested_longest_prefix() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("tree");
+        fs::create_dir_all(root.join("logs/nested")).unwrap();
+        let a = root.join("logs/a.bin");
+        let b = root.join("logs/nested/b.bin");
+        let c = root.join("logs/nested/c.bin");
+        fs::write(&a, vec![0u8; 10]).unwrap();
+        fs::write(&b, vec![0u8; 10]).unwrap();
+        fs::write(&c, vec![0u8; 10]).unwrap();
+        set_mtime(&a, 100);
+        set_mtime(&b, 300);
+        set_mtime(&c, 200);
+
+        let mut args = test_create_args(
+            dir.path().join("out.7z"),
+            vec![format!("{}/", root.display())],
+        );
+        args.dir_max_size = vec!["logs/=1000".into(), "logs/nested/=15".into()];
+        let (entries, stats) = build_selection(&args).unwrap();
+        let names: std::collections::HashSet<_> =
+            entries.iter().map(|e| e.archive_name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["logs/a.bin", "logs/nested/b.bin"].into_iter().collect()
+        );
+        assert_eq!(stats.skipped_dir_budget, 1);
     }
 }
