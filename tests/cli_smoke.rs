@@ -1,4 +1,4 @@
-//! Stage 0 CLI smoke tests: help surfaces and usage validation.
+//! CLI smoke tests: help surfaces, usage validation, create dry-run / embed.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -64,13 +64,50 @@ fn create_files_from_with_src_is_usage_error() {
 }
 
 #[test]
-fn create_with_src_is_not_implemented_exit_1() {
+fn create_write_still_not_implemented() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let f = dir.path().join("a.txt");
+    fs::write(&f, b"hi").unwrap();
     bin()
-        .args(["create", "-o", "out.7z", "."])
+        .args([
+            "create",
+            "-o",
+            dir.path().join("out.7z").to_str().unwrap(),
+            f.to_str().unwrap(),
+        ])
         .assert()
         .failure()
         .code(1)
         .stderr(predicate::str::contains("not implemented"));
+}
+
+#[test]
+fn create_dry_run_lists_files() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("tree");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("a.txt"), b"a").unwrap();
+    fs::write(root.join("sub/b.txt"), b"b").unwrap();
+    let src = format!("{}/", root.display());
+    bin()
+        .args([
+            "create",
+            "-o",
+            dir.path().join("out.7z").to_str().unwrap(),
+            "-n",
+            &src,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("a.txt"))
+        .stdout(predicate::str::contains("sub/b.txt"));
+    assert!(!dir.path().join("out.7z").exists());
 }
 
 #[test]
@@ -127,7 +164,7 @@ fn create_validate_unit_rejects_both_modes() {
         filter: vec![],
         level: 5,
         verify: false,
-        sources: vec![PathBuf::from("src")],
+        sources: vec!["src".into()],
     };
     assert!(args.validate().is_err());
 }
@@ -149,7 +186,7 @@ fn create_validate_unit_accepts_sources_only() {
         filter: vec![],
         level: 5,
         verify: false,
-        sources: vec![PathBuf::from("src")],
+        sources: vec!["src".into()],
     };
     assert!(args.validate().is_ok());
 }

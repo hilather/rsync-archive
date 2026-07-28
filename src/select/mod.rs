@@ -1,4 +1,4 @@
-//! Filesystem selection: path specs, rsync filter rules, and walk (later).
+//! Filesystem selection: path specs, rsync filter rules, and walk.
 //!
 //! Filter semantics: [`docs/SELECTION.md`](../../docs/SELECTION.md).
 
@@ -6,12 +6,16 @@ pub mod from_file;
 pub mod matcher;
 pub mod pathnorm;
 pub mod rules;
+pub mod walk;
 
 pub use from_file::{
     load_exclude_from, load_filter_from, load_include_from, read_capped_lines,
     read_capped_lines_from_reader, MAX_FILTER_FILE_BYTES, MAX_FILTER_FILE_LINES,
 };
 pub use rules::{parse_rule, Rule, RuleAction, RuleSet};
+pub use walk::{
+    collect_from_files_from, collect_from_sources, SelectedEntry, SelectionStats,
+};
 
 use crate::error::{Error, Result};
 use pathnorm::has_trailing_slash;

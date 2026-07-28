@@ -79,8 +79,10 @@ pub struct CreateArgs {
     pub verify: bool,
 
     /// Source paths (dirs and/or files). Required unless `--files-from` is set.
+    ///
+    /// Stored as strings so a trailing `/` is preserved (rsync-style naming).
     #[arg(value_name = "SRC")]
-    pub sources: Vec<PathBuf>,
+    pub sources: Vec<String>,
 }
 
 /// Arguments for `rsync-archive embed`.

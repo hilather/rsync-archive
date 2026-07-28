@@ -32,9 +32,7 @@ fn run() -> std::result::Result<(), ExitError> {
     match cli.command {
         Command::Create(args) => {
             args.validate().map_err(ExitError::Usage)?;
-            Err(ExitError::Ops(Error::NotImplemented(
-                "create (Stage 5–6b; dry-run in Stage 5, write in Stage 6/6b)",
-            )))
+            rsync_archive::pipeline::run_create(args).map_err(ExitError::Ops)
         }
         Command::Embed(args) => {
             rsync_archive::pipeline::run_embed(args).map_err(ExitError::Ops)

@@ -117,14 +117,15 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | `src/select/rules.rs` | `Rule`, `RuleAction`, `RuleSet`, pattern parse |
 | `src/select/matcher.rs` | Path match, `action_for`, `should_prune_dir` |
 | `src/select/from_file.rs` | include-from / exclude-from / filter files; size/line caps |
+| `src/select/walk.rs` | SRC walk + `--files-from` → `SelectedEntry`; prune; collisions |
 | `src/pipeline/output.rs` | `*.partial` naming, `--force` check, rename commit |
+| `src/pipeline/create.rs` | **`create` selection + dry-run**; write Stage 6 |
 | `src/util/` | Tracing init (`-v` / `-vv`) |
 | `src/archive/mod.rs` | Archive module root; re-exports store writer API |
 | `src/archive/sevenz/header.rs` | `HeaderFile`, `write_raw_header`, `write_start_header`, empty bits, names, mtime, attrs |
 | `src/archive/sevenz/store_writer.rs` | `NonsolidStoreWriter` (Copy `0x00`) — embed foundation |
 | `src/archive/sevenz/` | Headers + store writer; LZMA2 create writer (later) |
 | `src/pipeline/embed.rs` | **`embed` command** — naming, magic, store write, verify |
-| `src/pipeline/` | create / verify (later) |
 | `docs/DESIGN.md` | Full design (stages, decisions) |
 | `docs/SELECTION.md` | **Filter semantics source of truth** (Stage 4 frozen v1; keep in sync with `src/select/`) |
 | `tests/` | e2e and parity (`cli_smoke`, `filter_parity`) |
