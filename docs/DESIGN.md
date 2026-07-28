@@ -1349,6 +1349,45 @@ Not outline-only. Stage 0 exit requires a complete skill file including:
 
 **Regression tests for stage (K30):** new filter dialect table cases; any new format writer roundtrip e2e.
 
+#### Feature backlog (selection) — directory size budgets (requested)
+
+> Product request (2026-07-28): when a **directory** has a size collection limit, prefer **most recently modified** files first so the budget fills with newest content; **log** every file dropped because the directory budget was exhausted.
+
+| ID | Requirement | Notes |
+|----|-------------|--------|
+| **S9-DIRBUDGET** | Per-directory (or per-folder-rule) **max total selected bytes** under that directory | Distinct from global `--max-size` per-file; this is a **quota on the set of selected children**. |
+| **S9-MTIME-ORDER** | Under a budgeted directory, consider candidates in **mtime descending** (newest first) | Only after normal include/exclude filters apply. Tie-break: stable path order. |
+| **S9-ACCUMULATE** | Walk candidates newest-first; **include** while `running_sum + file_size ≤ budget`; stop adding further files under that dir once budget is full | Subdirectories: either nest budgets (parent + child rules) or apply budget only at the directory matching the rule — **decide in Stage 9 design spike** (default proposal: budget applies to the **recursive set of regular files** under the matched directory after filters). |
+| **S9-LOG-EXCLUDED** | Files not selected **only** due to budget must be logged (info/warn): path, size, mtime, budget id/limit, running sum | Distinct from rsync exclude; dry-run should list them in stderr summary and optionally `-v` lines. Counters: `skipped_dir_budget`. |
+| **S9-DRYRUN** | Dry-run uses the **same** budget + mtime ordering as write | Same `build_selection` path. |
+
+**CLI sketch (not frozen; Stage 9):**
+
+```text
+# Example ideas (exact flag names TBD in Stage 9):
+--dir-max-size PATH=SIZE     # e.g. --dir-max-size logs/=100M
+# or extended list dialect:
+#   dir-max-size logs/ 100M
+```
+
+**Algorithm sketch:**
+
+```text
+for each budgeted directory D with limit L:
+  candidates = regular files under D that passed include/exclude
+  sort candidates by mtime desc, then archive_name asc
+  sum = 0
+  for f in candidates:
+    if sum + f.size <= L:
+      select f; sum += f.size
+    else:
+      skip f; log budget exclusion; stats.skipped_dir_budget++
+```
+
+**Out of scope for this backlog item:** changing default walk order for unbudgeted trees (current walk order may remain filesystem order until Stage 9).
+
+**Depends on:** Stage 5 selection builder (done); best after Stage 6 create write so end-to-end archives respect budgets.
+
 ---
 
 ## v1 acceptance script (commands + expected outcomes)

@@ -128,6 +128,7 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | `src/pipeline/embed.rs` | **`embed` command** — naming, magic, store write, verify |
 | `docs/DESIGN.md` | Full design (stages, decisions) |
 | `docs/SELECTION.md` | **Filter semantics source of truth** (Stage 4 frozen v1; keep in sync with `src/select/`) |
+| `docs/BACKLOG.md` | Product feature backlog (not yet implemented) |
 | `tests/` | e2e and parity (`cli_smoke`, `filter_parity`) |
 | `.grok/skills/keep-docs-current/` | Docs sync skill |
 | `.grok/skills/keep-tests-current/` | Regression test skill |

@@ -147,7 +147,7 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for stages and PR plan.
 | 6 Create LZMA2 write | Planned |
 | 6b Streaming LZMA2 (v1 blocker) | Planned |
 | 7 Verify + acceptance | Planned |
-
+| 9+ Directory size budgets (newest-first) | **Backlog** — [`docs/BACKLOG.md`](docs/BACKLOG.md) |
 ---
 
 ## Project layout
