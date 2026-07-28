@@ -27,7 +27,9 @@ fn create_help_shows_key_flags() {
         .stdout(predicate::str::contains("--force"))
         .stdout(predicate::str::contains("--exclude"))
         .stdout(predicate::str::contains("--files-from"))
-        .stdout(predicate::str::contains("--level"));
+        .stdout(predicate::str::contains("--level"))
+        .stdout(predicate::str::contains("--threads"))
+        .stdout(predicate::str::contains("--encode-size-budget"));
 }
 
 #[test]
@@ -167,6 +169,9 @@ fn create_validate_unit_rejects_both_modes() {
         files_from: Some(PathBuf::from("list.txt")),
         filter: vec![],
         level: 5,
+        threads: None,
+        encode_concurrency: 0,
+        encode_size_budget: "500M".into(),
         verify: false,
         sources: vec!["src".into()],
     };
@@ -189,6 +194,9 @@ fn create_validate_unit_accepts_sources_only() {
         files_from: None,
         filter: vec![],
         level: 5,
+        threads: None,
+        encode_concurrency: 0,
+        encode_size_budget: "500M".into(),
         verify: false,
         sources: vec!["src".into()],
     };

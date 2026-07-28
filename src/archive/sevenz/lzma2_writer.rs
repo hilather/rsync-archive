@@ -92,8 +92,20 @@ impl NonsolidLzma2Writer {
 
     /// Append precompressed pack (tests / batch).
     pub fn push_packed(&mut self, name: String, compressed: Lzma2Compressed) -> Result<()> {
+        self.push_packed_with_mtime(name, compressed, None)
+    }
+
+    /// Append precompressed pack with optional mtime.
+    pub fn push_packed_with_mtime(
+        &mut self,
+        name: String,
+        compressed: Lzma2Compressed,
+        mtime: Option<u64>,
+    ) -> Result<()> {
         if compressed.uncompressed_size == 0 && compressed.data.is_empty() {
-            self.files.push(HeaderFile::empty_file(name));
+            let mut hf = HeaderFile::empty_file(name);
+            hf.mtime = mtime;
+            self.files.push(hf);
             return Ok(());
         }
         let pack_crc = crc32fast::hash(&compressed.data);
@@ -107,7 +119,7 @@ impl NonsolidLzma2Writer {
             method_id: vec![0x21],
             method_props: vec![compressed.props],
             empty: false,
-            mtime: None,
+            mtime,
         });
         Ok(())
     }

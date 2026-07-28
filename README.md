@@ -75,7 +75,9 @@ rsync-archive create -o out.7z --files-from list.txt --dry-run
 rsync-archive create -o out.7z --force --level 1 /data/tree
 ```
 
-**Write model:** non-solid 7z, **LZMA2** (`0x21`) per non-empty file; empty files via empty flags; mtime from source; `OUT.partial` → rename; stream read + stream encode (peak RAM ≈ encoder dict for `--level`, not full file size).
+**Write model:** non-solid 7z, **LZMA2** (`0x21`) per non-empty file; empty files via empty flags; mtime from source; `OUT.partial` → rename; stream read + encode. Parallel encode uses **archiveconverter-style** worker + **500M** in-flight size budget (ordered pack append).
+
+**Planned codecs:** seekable **Zstd** and **LZ4** (`--method`) — see [`docs/BACKLOG.md`](docs/BACKLOG.md).
 
 **Trailing `/` on SRC** strips the directory name from archive paths (`photos/` → `a.jpg`; `photos` → `photos/a.jpg`).  
 **`--files-from`:** exclusive of `SRC...`; relative lines keep path as member name; absolute lines use basename.  
@@ -114,6 +116,9 @@ Default naming flattens to **basename**. Missing 7z magic **warns** (stderr log)
 | `--files-from` | — | Explicit file list (exclusive of `SRC...`) |
 | `--filter` | — | `+ pattern` / `- pattern` (repeatable) |
 | `--level` | `5` | LZMA2 level 0–9 |
+| `--threads` | auto | Encode workers (omit = auto: many tiny files → 1, else CPUs) |
+| `--encode-concurrency` | `0` | Max concurrent encodes (`0` = auto from threads) |
+| `--encode-size-budget` | `500M` | Max in-flight uncompressed size (`0` = unlimited) |
 | `--verify` | off | Post-write test |
 | `SRC...` | — | Sources (required unless `--files-from`) |
 
@@ -148,8 +153,10 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for stages and PR plan.
 | 4 Rsync filter engine | **Done** — see [`docs/SELECTION.md`](docs/SELECTION.md) |
 | 5 Walk + create dry-run | **Done** — `create -n` / selection / files-from / prune |
 | 6 Create LZMA2 write | **Done** — non-solid LZMA2 create + verify |
-| 6b Streaming large-file hardening | Partial — Stage 6 already streams via `Lzma2Writer`; large-file e2e/RSS still optional |
+| 6b Streaming large-file hardening | Partial — Stage 6 streams via `Lzma2Writer`; large-file e2e/RSS still optional |
+| 8 Parallel encode (AC-style threads) | **Done** — `--threads` / `--encode-concurrency` / `--encode-size-budget 500M` |
 | 7 Verify + acceptance | Planned |
+| Codec: seekable Zstd + LZ4 | **Backlog** — [`docs/BACKLOG.md`](docs/BACKLOG.md) |
 | 9+ Directory size budgets (newest-first) | **Backlog** — [`docs/BACKLOG.md`](docs/BACKLOG.md) |
 ---
 

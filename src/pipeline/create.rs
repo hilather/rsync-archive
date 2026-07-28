@@ -1,5 +1,11 @@
 //! Create pipeline: selection, dry-run, and LZMA2 non-solid write.
+//!
+//! Parallel encode (archiveconverter-style):
+//! - `--threads` omit = auto (many tiny files → 1 worker; else CPU count)
+//! - `--encode-concurrency 0` = auto from threads
+//! - `--encode-size-budget` default `500M` (in-flight uncompressed bytes)
 
+use crate::archive::sevenz::{compress_path, filetime_from_unix_secs, Lzma2Compressed};
 use crate::archive::NonsolidLzma2Writer;
 use crate::cli::CreateArgs;
 use crate::error::{Error, Result};
@@ -9,7 +15,12 @@ use crate::select::walk::{
     collect_from_files_from, collect_from_sources, SelectedEntry, SelectionStats,
 };
 use crate::select::{RuleSet, SourceSpec};
+use crate::util::{
+    can_admit, file_stats_from_sizes, parse_byte_size, resolve_encode_concurrency,
+    resolve_encode_workers,
+};
 use std::path::Path;
+use std::thread;
 use tracing::info;
 
 /// Build the ordered filter set from create CLI flags.
@@ -85,8 +96,28 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
         return Err(Error::EmptyArchive);
     }
 
+    let (n, total_bytes) = file_stats_from_sizes(entries.iter().map(|e| e.size));
+    let workers = resolve_encode_workers(args.threads, n, total_bytes);
+    let concurrency = resolve_encode_concurrency(args.encode_concurrency, workers);
+    let size_budget = parse_byte_size(&args.encode_size_budget)?;
+
+    info!(
+        workers,
+        concurrency,
+        size_budget,
+        file_count = n,
+        total_bytes,
+        "create encode schedule"
+    );
+
     let paths = prepare_output(&args.output, args.force)?;
-    match write_create_archive(&paths.partial_path, &entries, args.level) {
+    match write_create_archive(
+        &paths.partial_path,
+        &entries,
+        args.level,
+        concurrency,
+        size_budget,
+    ) {
         Ok(()) => {
             commit_output(&paths)?;
             print_selection_summary(&stats, false);
@@ -94,12 +125,14 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
                 path = %paths.final_path.display(),
                 count = entries.len(),
                 level = args.level,
+                concurrency,
                 "create complete"
             );
             eprintln!(
-                "created {} member(s) → {}",
+                "created {} member(s) → {} (encode concurrency {})",
                 entries.len(),
-                paths.final_path.display()
+                paths.final_path.display(),
+                concurrency
             );
             if args.verify {
                 verify_create_archive(&paths.final_path, entries.len())?;
@@ -113,16 +146,158 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
     }
 }
 
+/// One file fully compressed (or empty), ready for ordered pack append.
+struct PreparedMember {
+    name: String,
+    mtime: Option<u64>,
+    empty: bool,
+    compressed: Option<Lzma2Compressed>,
+}
+
 fn write_create_archive(
     partial: &Path,
     entries: &[SelectedEntry],
     level: u32,
+    concurrency: usize,
+    size_budget: u64,
 ) -> Result<()> {
+    if concurrency <= 1 {
+        let mut w = NonsolidLzma2Writer::create(partial, level)?;
+        for e in entries {
+            w.push_path(e.archive_name.clone(), &e.abs_path)?;
+        }
+        return w.finish();
+    }
+
+    let prepared = encode_parallel(entries, level, concurrency, size_budget)?;
     let mut w = NonsolidLzma2Writer::create(partial, level)?;
-    for e in entries {
-        w.push_path(e.archive_name.clone(), &e.abs_path)?;
+    for p in prepared {
+        if p.empty {
+            w.push_packed_with_mtime(
+                p.name,
+                Lzma2Compressed {
+                    data: vec![],
+                    props: 0,
+                    crc32: 0,
+                    uncompressed_size: 0,
+                },
+                p.mtime,
+            )?;
+        } else if let Some(c) = p.compressed {
+            w.push_packed_with_mtime(p.name, c, p.mtime)?;
+        }
     }
     w.finish()
+}
+
+fn encode_one(entry: &SelectedEntry, level: u32) -> Result<PreparedMember> {
+    let meta = std::fs::symlink_metadata(&entry.abs_path).map_err(|e| {
+        Error::Archive(format!("stat {} for create: {e}", entry.abs_path.display()))
+    })?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(Error::NotRegularFile(entry.abs_path.clone()));
+    }
+    let mtime = meta.modified().ok().and_then(|t| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| filetime_from_unix_secs(d.as_secs()))
+    });
+
+    if meta.len() == 0 {
+        return Ok(PreparedMember {
+            name: entry.archive_name.clone(),
+            mtime,
+            empty: true,
+            compressed: None,
+        });
+    }
+
+    let compressed = compress_path(&entry.abs_path, level)?;
+    Ok(PreparedMember {
+        name: entry.archive_name.clone(),
+        mtime,
+        empty: false,
+        compressed: Some(compressed),
+    })
+}
+
+/// Size-aware concurrent encode; results in **selection order**.
+fn encode_parallel(
+    entries: &[SelectedEntry],
+    level: u32,
+    max_workers: usize,
+    size_budget: u64,
+) -> Result<Vec<PreparedMember>> {
+    let n = entries.len();
+    if n == 0 {
+        return Ok(vec![]);
+    }
+
+    // Slot results; filled out-of-order by workers.
+    let mut slots: Vec<Option<Result<PreparedMember>>> = (0..n).map(|_| None).collect();
+
+    thread::scope(|scope| {
+        let mut i = 0usize;
+        let mut running_sum = 0u64;
+        // (job_size, index, JoinHandle)
+        let mut handles: Vec<(u64, usize, thread::ScopedJoinHandle<'_, Result<PreparedMember>>)> =
+            Vec::new();
+
+        while i < n || !handles.is_empty() {
+            // Admit new jobs.
+            while i < n
+                && can_admit(
+                    running_sum,
+                    handles.len(),
+                    entries[i].size,
+                    size_budget,
+                    max_workers,
+                )
+            {
+                let idx = i;
+                let size = entries[i].size;
+                let entry = entries[i].clone();
+                running_sum = running_sum.saturating_add(size);
+                i += 1;
+                let handle = scope.spawn(move || encode_one(&entry, level));
+                handles.push((size, idx, handle));
+            }
+
+            if handles.is_empty() {
+                // Cannot admit next job (shouldn't happen: first job always admits).
+                if i < n {
+                    return Err(Error::Message(format!(
+                        "encode scheduler stuck at index {i} (workers={max_workers} budget={size_budget})"
+                    )));
+                }
+                break;
+            }
+
+            // Join the oldest in-flight job (FIFO) to free budget.
+            let (size, idx, handle) = handles.remove(0);
+            let result = handle.join().map_err(|_| {
+                Error::Message("encode worker panicked".into())
+            })?;
+            running_sum = running_sum.saturating_sub(size);
+            slots[idx] = Some(result);
+        }
+
+        Ok(())
+    })?;
+
+    let mut out = Vec::with_capacity(n);
+    for (i, slot) in slots.into_iter().enumerate() {
+        match slot {
+            Some(Ok(p)) => out.push(p),
+            Some(Err(e)) => return Err(e),
+            None => {
+                return Err(Error::Message(format!(
+                    "internal: missing encode result for index {i}"
+                )));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn verify_create_archive(path: &Path, expected_files: usize) -> Result<()> {
@@ -188,6 +363,9 @@ pub(crate) fn test_create_args(
         files_from: None,
         filter: vec![],
         level: 5,
+        threads: Some(1),
+        encode_concurrency: 1,
+        encode_size_budget: "500M".into(),
         verify: false,
         sources,
     }
@@ -267,6 +445,8 @@ mod tests {
         args.dry_run = false;
         args.level = 1;
         args.verify = true;
+        args.threads = Some(2);
+        args.encode_concurrency = 2;
         run_create(args).unwrap();
 
         assert!(out.exists());

@@ -74,6 +74,21 @@ pub struct CreateArgs {
     #[arg(long = "level", default_value_t = 5, value_parser = clap::value_parser!(u32).range(0..=9))]
     pub level: u32,
 
+    /// Encode worker count (archiveconverter-style). Omit for auto:
+    /// many tiny files → 1; else available CPU parallelism.
+    #[arg(long)]
+    pub threads: Option<u32>,
+
+    /// Max concurrent file encodes (`0` = auto from `--threads` / CPUs).
+    /// Same idea as archiveconverter `--nested-concurrency`.
+    #[arg(long = "encode-concurrency", default_value_t = 0)]
+    pub encode_concurrency: usize,
+
+    /// Max total **uncompressed** size of files encoding at once (default `500M`).
+    /// `0` = no size cap. Same default as archiveconverter `--nested-size-budget`.
+    #[arg(long = "encode-size-budget", default_value = "500M")]
+    pub encode_size_budget: String,
+
     /// After write, list/test the archive.
     #[arg(long = "verify")]
     pub verify: bool,

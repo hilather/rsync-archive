@@ -93,6 +93,9 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | Create format | **Non-solid** 7z only |
 | Create compression | LZMA2 `0x21` for non-empty; empty via empty flags |
 | Compression level | **5** |
+| Encode threads | **auto** (omit `--threads`; many tiny files → 1) |
+| Encode concurrency | **0** → auto from threads |
+| Encode size budget | **500M** in-flight uncompressed (like archiveconverter nested budget) |
 | Embed method | **Copy** `0x00` (store), no recompress |
 | Embed naming | **Basename flatten** unless `--keep-path` |
 | Overwrite | **Error** if `-o` exists unless `--force` |
@@ -130,7 +133,9 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | `src/pipeline/embed.rs` | **`embed` command** — naming, magic, store write, verify |
 | `docs/DESIGN.md` | Full design (stages, decisions) |
 | `docs/SELECTION.md` | **Filter semantics source of truth** (Stage 4 frozen v1; keep in sync with `src/select/`) |
-| `docs/BACKLOG.md` | Product feature backlog (not yet implemented) |
+| `docs/BACKLOG.md` | Product feature backlog (Zstd/LZ4, dir budgets, …) |
+| `src/util/auto_threads.rs` | AC-style auto workers (tiny-file → 1) |
+| `src/util/size_parse.rs` | `500M` budget parse + admit helper |
 | `tests/` | e2e and parity (`cli_smoke`, `filter_parity`) |
 | `.grok/skills/keep-docs-current/` | Docs sync skill |
 | `.grok/skills/keep-tests-current/` | Regression test skill |
