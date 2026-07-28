@@ -4,7 +4,7 @@
 
 | | |
 |--|--|
-| **Status** | Stage 1 complete; create/embed pipelines not implemented yet |
+| **Status** | Stage 2 complete (header + Copy store writer); create/embed pipelines not implemented yet |
 | **License** | MIT |
 | **Design** | [`docs/DESIGN.md`](docs/DESIGN.md) |
 | **Agent policy** | [`AGENTS.md`](AGENTS.md) (docs **and** tests required on every change) |
@@ -127,7 +127,7 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for stages and PR plan.
 |-------|--------|
 | 0 Bootstrap + agent docs/tests policy | **Done** |
 | 1 Foundations (errors, pathnorm, output helpers) | **Done** |
-| 2 7z header + store writer | Planned |
+| 2 7z header + store writer | **Done** (library: `NonsolidStoreWriter` Copy / method `0x00`; embed foundation) |
 | 3 Embed pipeline | Planned |
 | 4 Rsync filter engine | Planned |
 | 5 Walk + create dry-run | Planned |
@@ -142,10 +142,11 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for stages and PR plan.
 ```text
 src/
   main.rs, cli.rs, lib.rs, error.rs
+  archive/sevenz/    # non-solid header + NonsolidStoreWriter (Copy) for embed
   select/            # SourceSpec, pathnorm (filters/walk later)
   pipeline/output.rs # partial path, --force check, rename helpers
   util/              # tracing init
-  # later: archive/sevenz/, pipeline/{create,embed}
+  # later: archive/sevenz/lzma2_writer, pipeline/{create,embed}
 docs/
   DESIGN.md          # full design
   SELECTION.md       # filter semantics (Stage 4)

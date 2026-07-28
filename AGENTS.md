@@ -116,7 +116,10 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | `src/select/mod.rs` | `SourceSpec`, archive name mapping (filters/walk later) |
 | `src/pipeline/output.rs` | `*.partial` naming, `--force` check, rename commit |
 | `src/util/` | Tracing init (`-v` / `-vv`) |
-| `src/archive/sevenz/` | Headers, store writer, LZMA2 create (later) |
+| `src/archive/mod.rs` | Archive module root; re-exports store writer API |
+| `src/archive/sevenz/header.rs` | `HeaderFile`, `write_raw_header`, `write_start_header`, empty bits, names, mtime, attrs |
+| `src/archive/sevenz/store_writer.rs` | `NonsolidStoreWriter` (Copy `0x00`) — embed foundation |
+| `src/archive/sevenz/` | Headers + store writer; LZMA2 create writer (later) |
 | `src/pipeline/` | create / embed / verify (later) |
 | `docs/DESIGN.md` | Full design (stages, decisions) |
 | `docs/SELECTION.md` | Filter semantics (Stage 4+) |
