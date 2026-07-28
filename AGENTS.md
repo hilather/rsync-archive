@@ -93,6 +93,7 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | Create format | **Non-solid** 7z only |
 | Create compression | LZMA2 `0x21` for non-empty; empty via empty flags |
 | Compression level | **5** |
+| Create method | **lzma2** default; also `zstd`, `lz4` |
 | Encode threads | **auto** (omit `--threads`; many tiny files → 1) |
 | Encode concurrency | **0** → auto from threads |
 | Encode size budget | **500M** in-flight uncompressed (like archiveconverter nested budget) |

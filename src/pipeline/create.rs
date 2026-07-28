@@ -5,7 +5,9 @@
 //! - `--encode-concurrency 0` = auto from threads
 //! - `--encode-size-budget` default `500M` (in-flight uncompressed bytes)
 
-use crate::archive::sevenz::{compress_path, filetime_from_unix_secs, Lzma2Compressed};
+use crate::archive::sevenz::{
+    compress_path, filetime_from_unix_secs, CompressedPack, CompressMethod,
+};
 use crate::archive::NonsolidLzma2Writer;
 use crate::cli::CreateArgs;
 use crate::error::{Error, Result};
@@ -96,12 +98,14 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
         return Err(Error::EmptyArchive);
     }
 
+    let method = CompressMethod::parse(&args.method)?;
     let (n, total_bytes) = file_stats_from_sizes(entries.iter().map(|e| e.size));
     let workers = resolve_encode_workers(args.threads, n, total_bytes);
     let concurrency = resolve_encode_concurrency(args.encode_concurrency, workers);
     let size_budget = parse_byte_size(&args.encode_size_budget)?;
 
     info!(
+        method = method.as_str(),
         workers,
         concurrency,
         size_budget,
@@ -115,6 +119,7 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
         &paths.partial_path,
         &entries,
         args.level,
+        method,
         concurrency,
         size_budget,
     ) {
@@ -125,13 +130,15 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
                 path = %paths.final_path.display(),
                 count = entries.len(),
                 level = args.level,
+                method = method.as_str(),
                 concurrency,
                 "create complete"
             );
             eprintln!(
-                "created {} member(s) → {} (encode concurrency {})",
+                "created {} member(s) → {} (method {}, concurrency {})",
                 entries.len(),
                 paths.final_path.display(),
+                method.as_str(),
                 concurrency
             );
             if args.verify {
@@ -151,33 +158,35 @@ struct PreparedMember {
     name: String,
     mtime: Option<u64>,
     empty: bool,
-    compressed: Option<Lzma2Compressed>,
+    compressed: Option<CompressedPack>,
 }
 
 fn write_create_archive(
     partial: &Path,
     entries: &[SelectedEntry],
     level: u32,
+    method: CompressMethod,
     concurrency: usize,
     size_budget: u64,
 ) -> Result<()> {
     if concurrency <= 1 {
-        let mut w = NonsolidLzma2Writer::create(partial, level)?;
+        let mut w = NonsolidLzma2Writer::create_with_method(partial, level, method)?;
         for e in entries {
             w.push_path(e.archive_name.clone(), &e.abs_path)?;
         }
         return w.finish();
     }
 
-    let prepared = encode_parallel(entries, level, concurrency, size_budget)?;
-    let mut w = NonsolidLzma2Writer::create(partial, level)?;
+    let prepared = encode_parallel(entries, level, method, concurrency, size_budget)?;
+    let mut w = NonsolidLzma2Writer::create_with_method(partial, level, method)?;
     for p in prepared {
         if p.empty {
             w.push_packed_with_mtime(
                 p.name,
-                Lzma2Compressed {
+                CompressedPack {
                     data: vec![],
-                    props: 0,
+                    method_id: vec![0x00],
+                    method_props: vec![],
                     crc32: 0,
                     uncompressed_size: 0,
                 },
@@ -190,7 +199,11 @@ fn write_create_archive(
     w.finish()
 }
 
-fn encode_one(entry: &SelectedEntry, level: u32) -> Result<PreparedMember> {
+fn encode_one(
+    entry: &SelectedEntry,
+    level: u32,
+    method: CompressMethod,
+) -> Result<PreparedMember> {
     let meta = std::fs::symlink_metadata(&entry.abs_path).map_err(|e| {
         Error::Archive(format!("stat {} for create: {e}", entry.abs_path.display()))
     })?;
@@ -212,7 +225,7 @@ fn encode_one(entry: &SelectedEntry, level: u32) -> Result<PreparedMember> {
         });
     }
 
-    let compressed = compress_path(&entry.abs_path, level)?;
+    let compressed = compress_path(&entry.abs_path, method, level)?;
     Ok(PreparedMember {
         name: entry.archive_name.clone(),
         mtime,
@@ -225,6 +238,7 @@ fn encode_one(entry: &SelectedEntry, level: u32) -> Result<PreparedMember> {
 fn encode_parallel(
     entries: &[SelectedEntry],
     level: u32,
+    method: CompressMethod,
     max_workers: usize,
     size_budget: u64,
 ) -> Result<Vec<PreparedMember>> {
@@ -259,7 +273,7 @@ fn encode_parallel(
                 let entry = entries[i].clone();
                 running_sum = running_sum.saturating_add(size);
                 i += 1;
-                let handle = scope.spawn(move || encode_one(&entry, level));
+                let handle = scope.spawn(move || encode_one(&entry, level, method));
                 handles.push((size, idx, handle));
             }
 
@@ -363,6 +377,7 @@ pub(crate) fn test_create_args(
         files_from: None,
         filter: vec![],
         level: 5,
+        method: "lzma2".into(),
         threads: Some(1),
         encode_concurrency: 1,
         encode_size_budget: "500M".into(),
@@ -470,6 +485,29 @@ mod tests {
         args.dry_run = false;
         let err = run_create(args).unwrap_err();
         assert!(matches!(err, Error::OutputExists(_)));
+    }
+
+    #[test]
+    fn create_zstd_and_lz4_roundtrip() {
+        for method in ["zstd", "lz4"] {
+            let dir = tempdir().unwrap();
+            let f = dir.path().join("a.txt");
+            fs::write(&f, format!("payload-{method}")).unwrap();
+            let out = dir.path().join("out.7z");
+            let mut args = test_create_args(out.clone(), vec![f.to_string_lossy().into()]);
+            args.dry_run = false;
+            args.method = method.into();
+            args.level = 3;
+            args.verify = true;
+            run_create(args).unwrap();
+            let mut reader =
+                ArchiveReader::open(&out, Password::empty()).expect("open");
+            assert!(!reader.archive().is_solid);
+            assert_eq!(
+                reader.read_file("a.txt").unwrap(),
+                format!("payload-{method}").as_bytes()
+            );
+        }
     }
 
     #[test]

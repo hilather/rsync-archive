@@ -1,13 +1,14 @@
-//! Non-solid 7z header layout, Copy store writer, and LZMA2 create writer.
+//! Non-solid 7z header layout, Copy store writer, and multi-method create writer.
 
 mod codec;
 mod header;
 mod lzma2_writer;
+mod method;
 mod store_writer;
 
 pub use codec::{
     compress_bytes, compress_path, compress_reader, compress_reader_append_pack,
-    compress_reader_to_writer, dict_size_for_level, lzma2_dict_prop, options_for_level,
+    compress_reader_to_writer, dict_size_for_level, lzma2_dict_prop, CompressedPack,
     Lzma2Compressed, PackCrcWriter,
 };
 pub use header::{
@@ -17,4 +18,5 @@ pub use header::{
     K_PACK_INFO, K_SIZE, K_SUB_STREAMS_INFO, K_UNPACK_INFO, K_WIN_ATTRIBUTES,
 };
 pub use lzma2_writer::NonsolidLzma2Writer;
+pub use method::CompressMethod;
 pub use store_writer::NonsolidStoreWriter;

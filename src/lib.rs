@@ -12,8 +12,8 @@ pub mod select;
 pub mod util;
 
 pub use archive::{
-    write_raw_header, write_start_header, HeaderFile, NonsolidLzma2Writer, NonsolidStoreWriter,
-    SIG_HEADER_SIZE,
+    write_raw_header, write_start_header, CompressMethod, HeaderFile, NonsolidLzma2Writer,
+    NonsolidStoreWriter, SIG_HEADER_SIZE,
 };
 pub use error::{Error, Result};
 pub use pipeline::{

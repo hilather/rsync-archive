@@ -20,12 +20,14 @@ path = "src/lib.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 crc32fast = "1"
+lz4_flex = "0.11"
 lzma-rust2 = { version = "0.16", default-features = false, features = ["std", "encoder"] }
-sevenz-rust2 = { version = "0.21", features = ["util"] }
+sevenz-rust2 = { version = "0.21", features = ["util", "zstd", "lz4"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
+zstd = "0.13"
 
 [dev-dependencies]
 assert_cmd = "2"

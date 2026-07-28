@@ -70,9 +70,15 @@ pub struct CreateArgs {
     #[arg(long = "filter", value_name = "RULE", action = clap::ArgAction::Append)]
     pub filter: Vec<String>,
 
-    /// Compression level 0–9 (default 5).
+    /// Compression level 0–9 (default 5). Meaning depends on `--method`
+    /// (LZMA2 preset / mapped Zstd level; LZ4 ignores fine-grained levels).
     #[arg(long = "level", default_value_t = 5, value_parser = clap::value_parser!(u32).range(0..=9))]
     pub level: u32,
+
+    /// Compression method: `lzma2` (default), `zstd` (fast, strong ratio), or `lz4` (fastest).
+    /// All produce **non-solid** per-file packs (file-level random access).
+    #[arg(long = "method", default_value = "lzma2")]
+    pub method: String,
 
     /// Encode worker count (archiveconverter-style). Omit for auto:
     /// many tiny files → 1; else available CPU parallelism.

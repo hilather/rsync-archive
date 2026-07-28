@@ -3,6 +3,6 @@
 pub mod sevenz;
 
 pub use sevenz::{
-    write_raw_header, write_start_header, HeaderFile, NonsolidLzma2Writer, NonsolidStoreWriter,
-    SIG_HEADER_SIZE,
+    write_raw_header, write_start_header, CompressMethod, HeaderFile, NonsolidLzma2Writer,
+    NonsolidStoreWriter, SIG_HEADER_SIZE,
 };

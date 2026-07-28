@@ -36,39 +36,22 @@ When a backlog item ships, move it to README status / SELECTION and delete or ma
 
 ## Codecs / formats (random-access friendly)
 
-### Seekable Zstd create method
+### Zstd + LZ4 create methods (7z non-solid)
+
+**Status:** **Done** — `create --method zstd|lz4|lzma2`  
+
+File-level random access via independent packs. Uses `zstd` (libzstd) and `lz4_flex`.
+
+### True seekable-Zstd single stream (optional)
 
 **Status:** Planned  
-**IDs:** `CODEC-ZSTD-SEEKABLE`
+**IDs:** `CODEC-ZSTD-SEEKABLE-STREAM`
 
 | Requirement | Detail |
 |-------------|--------|
-| Method | Per-member **Zstd** packs in non-solid 7z **or** seekable-zstd outer for single-blob / tar-like use |
-| Seekable | Prefer **Zstd seekable format** (independent frames + seek table) for byte-range access |
-| Rust crates | Primary: [`zstd`](https://crates.io/crates/zstd) (libzstd); seekable: [`zeekstd`](https://crates.io/crates/zeekstd) / [`zstd-framed`](https://crates.io/crates/zstd-framed) |
-| CLI sketch | `--method zstd` (default later?) · level map · keep non-solid multi-file semantics |
-| Why | Best speed × ratio for remount / partial read vs LZMA2 |
-
-### LZ4 create method
-
-**Status:** Planned  
-**IDs:** `CODEC-LZ4`
-
-| Requirement | Detail |
-|-------------|--------|
-| Method | Per-member **LZ4** packs in non-solid 7z (file-level random access) |
-| Rust crates | [`lz4_flex`](https://crates.io/crates/lz4_flex) (pure Rust) or `lz4` bindings |
-| CLI sketch | `--method lz4` |
-| Why | Maximum encode/decode speed; weaker ratio than Zstd |
-
-### Shared method plumbing
-
-**Status:** Planned with codecs  
-
-- `create --method lzma2|zstd|lz4` (lzma2 = current default until Zstd proven)  
-- Same streaming / ordered-append / thread budget pipeline  
-- Embed remains **Copy/store** only (no recompress)
-
+| Format | Zstd **seekable** multi-frame + seek table ([`zeekstd`](https://crates.io/crates/zeekstd)) |
+| Use case | Single huge blob / tar-like linear payload with byte-range reads |
+| Note | Distinct from per-file Zstd in non-solid 7z (already shipped) |
 ---
 
 ## Threading (archiveconverter parity)

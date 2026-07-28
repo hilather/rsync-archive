@@ -78,6 +78,52 @@ fn create_force_overwrite() {
 }
 
 #[test]
+fn create_method_zstd() {
+    let dir = tempdir().unwrap();
+    let f = dir.path().join("a.txt");
+    fs::write(&f, b"zstd-e2e").unwrap();
+    let out = dir.path().join("z.7z");
+    bin()
+        .args([
+            "create",
+            "-o",
+            out.to_str().unwrap(),
+            "--method",
+            "zstd",
+            "--level",
+            "3",
+            "--verify",
+            f.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let mut reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+    assert_eq!(reader.read_file("a.txt").unwrap(), b"zstd-e2e");
+}
+
+#[test]
+fn create_method_lz4() {
+    let dir = tempdir().unwrap();
+    let f = dir.path().join("a.txt");
+    fs::write(&f, b"lz4-e2e").unwrap();
+    let out = dir.path().join("l.7z");
+    bin()
+        .args([
+            "create",
+            "-o",
+            out.to_str().unwrap(),
+            "--method",
+            "lz4",
+            "--verify",
+            f.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let mut reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+    assert_eq!(reader.read_file("a.txt").unwrap(), b"lz4-e2e");
+}
+
+#[test]
 fn create_exists_without_force_fails() {
     let dir = tempdir().unwrap();
     let f = dir.path().join("a.txt");

@@ -75,9 +75,17 @@ rsync-archive create -o out.7z --files-from list.txt --dry-run
 rsync-archive create -o out.7z --force --level 1 /data/tree
 ```
 
-**Write model:** non-solid 7z, **LZMA2** (`0x21`) per non-empty file; empty files via empty flags; mtime from source; `OUT.partial` → rename; stream read + encode. Parallel encode uses **archiveconverter-style** worker + **500M** in-flight size budget (ordered pack append).
+**Write model:** non-solid 7z, **per-file packs** (file-level random access):
 
-**Planned codecs:** seekable **Zstd** and **LZ4** (`--method`) — see [`docs/BACKLOG.md`](docs/BACKLOG.md).
+| `--method` | Codec | Notes |
+|------------|--------|--------|
+| `lzma2` (default) | LZMA2 `0x21` | Best ratio, slower |
+| `zstd` | Zstd `04 F7 11 01` | Best speed×ratio (`zstd`/libzstd); independent frames per member |
+| `lz4` | LZ4 `04 F7 11 04` | Fastest |
+
+Empty files use empty flags; mtime from source; `OUT.partial` → rename. Parallel encode: AC-style workers + **500M** budget.
+
+**Still backlog:** true single-stream **seekable-zstd** (zeekstd) for tar-like blobs; dir size budgets — [`docs/BACKLOG.md`](docs/BACKLOG.md).
 
 **Trailing `/` on SRC** strips the directory name from archive paths (`photos/` → `a.jpg`; `photos` → `photos/a.jpg`).  
 **`--files-from`:** exclusive of `SRC...`; relative lines keep path as member name; absolute lines use basename.  
@@ -115,7 +123,8 @@ Default naming flattens to **basename**. Missing 7z magic **warns** (stderr log)
 | `--exclude-from` / `--include-from` | — | Pattern files |
 | `--files-from` | — | Explicit file list (exclusive of `SRC...`) |
 | `--filter` | — | `+ pattern` / `- pattern` (repeatable) |
-| `--level` | `5` | LZMA2 level 0–9 |
+| `--level` | `5` | Level 0–9 (LZMA2 preset / mapped Zstd; LZ4 mostly ignores) |
+| `--method` | `lzma2` | `lzma2` · `zstd` · `lz4` (non-solid per-file packs) |
 | `--threads` | auto | Encode workers (omit = auto: many tiny files → 1, else CPUs) |
 | `--encode-concurrency` | `0` | Max concurrent encodes (`0` = auto from threads) |
 | `--encode-size-budget` | `500M` | Max in-flight uncompressed size (`0` = unlimited) |
@@ -156,7 +165,8 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for stages and PR plan.
 | 6b Streaming large-file hardening | Partial — Stage 6 streams via `Lzma2Writer`; large-file e2e/RSS still optional |
 | 8 Parallel encode (AC-style threads) | **Done** — `--threads` / `--encode-concurrency` / `--encode-size-budget 500M` |
 | 7 Verify + acceptance | Planned |
-| Codec: seekable Zstd + LZ4 | **Backlog** — [`docs/BACKLOG.md`](docs/BACKLOG.md) |
+| Codec: Zstd + LZ4 in 7z | **Done** — `--method zstd|lz4` (file-level RA) |
+| True seekable-zstd stream (zeekstd) | **Backlog** — single-blob tar-like |
 | 9+ Directory size budgets (newest-first) | **Backlog** — [`docs/BACKLOG.md`](docs/BACKLOG.md) |
 ---
 

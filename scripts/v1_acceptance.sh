@@ -29,6 +29,10 @@ echo "== create write + verify =="
 "$BIN" create -o out.7z --exclude '*.tmp' --level 1 --threads 2 --verify tree/
 test -f out.7z
 
+echo "== create zstd / lz4 =="
+"$BIN" create -o z.7z --method zstd --level 3 --force --verify tree/
+"$BIN" create -o l.7z --method lz4 --force --verify tree/
+
 echo "== embed =="
 "$BIN" embed -o master.7z --allow-any --force --verify out.7z
 test -f master.7z

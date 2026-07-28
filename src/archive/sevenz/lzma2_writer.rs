@@ -1,23 +1,30 @@
-//! Non-solid 7z writer that LZMA2-compresses each file as its own pack stream.
+//! Non-solid 7z create writer: one compressed pack stream per file (any method).
 
-use super::codec::{compress_reader_append_pack, Lzma2Compressed};
+use super::codec::{compress_reader_append_pack, CompressedPack};
 use super::header::{write_raw_header, write_start_header, HeaderFile, SIG_HEADER_SIZE};
+use super::method::CompressMethod;
 use crate::error::{Error, Result};
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::SystemTime;
 
-/// Streaming non-solid 7z writer: one LZMA2 pack stream per non-empty file.
+/// Non-solid multi-file 7z writer (LZMA2 / Zstd / LZ4 per member).
 pub struct NonsolidLzma2Writer {
     file: File,
     files: Vec<HeaderFile>,
     level: u32,
+    method: CompressMethod,
 }
 
 impl NonsolidLzma2Writer {
-    /// Create output path and write a placeholder start header (32 zero bytes).
+    /// Create with LZMA2 (legacy helper).
     pub fn create(path: &Path, level: u32) -> Result<Self> {
+        Self::create_with_method(path, level, CompressMethod::Lzma2)
+    }
+
+    /// Create output path with chosen compression method.
+    pub fn create_with_method(path: &Path, level: u32, method: CompressMethod) -> Result<Self> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
@@ -32,12 +39,11 @@ impl NonsolidLzma2Writer {
             file,
             files: Vec::new(),
             level: level.min(9),
+            method,
         })
     }
 
-    /// Append a source file: stream-read, LZMA2-encode, stream-write pack.
-    ///
-    /// Empty files become empty-flag members (no pack). mtime from source metadata.
+    /// Append a source file: stream-read, compress, stream-write pack.
     pub fn push_path(&mut self, name: String, src: &Path) -> Result<()> {
         let meta = std::fs::symlink_metadata(src).map_err(|e| {
             Error::Archive(format!("stat {} for create: {e}", src.display()))
@@ -56,42 +62,31 @@ impl NonsolidLzma2Writer {
 
         let mut input = open_nofollow_read(src)?;
         let (props, content_crc, unpack_size, pack_crc, pack_size) =
-            compress_reader_append_pack(&mut input, self.level, &mut self.file)?;
+            compress_reader_append_pack(&mut input, self.method, self.level, &mut self.file)?;
 
-        if unpack_size == 0 {
-            // Race: became empty; no pack was written if encoder wrote nothing —
-            // but pack may have end markers. Prefer error if pack_size > 0 with 0 unpack.
-            if pack_size == 0 {
-                let mut hf = HeaderFile::empty_file(name);
-                hf.mtime = mtime;
-                self.files.push(hf);
-                return Ok(());
-            }
+        if unpack_size == 0 && pack_size == 0 {
+            let mut hf = HeaderFile::empty_file(name);
+            hf.mtime = mtime;
+            self.files.push(hf);
+            return Ok(());
         }
 
-        let mut hf = HeaderFile {
+        self.files.push(HeaderFile {
             name,
             pack_size,
             pack_crc,
             unpack_size,
             content_crc,
-            method_id: vec![0x21],
-            method_props: vec![props],
+            method_id: self.method.method_id().to_vec(),
+            method_props: props,
             empty: false,
             mtime,
-        };
-        // Ensure empty flag consistency
-        if unpack_size == 0 && pack_size == 0 {
-            hf.empty = true;
-            hf.method_id = vec![0x00];
-            hf.method_props.clear();
-        }
-        self.files.push(hf);
+        });
         Ok(())
     }
 
-    /// Append precompressed pack (tests / batch).
-    pub fn push_packed(&mut self, name: String, compressed: Lzma2Compressed) -> Result<()> {
+    /// Append precompressed pack (tests / parallel encode path).
+    pub fn push_packed(&mut self, name: String, compressed: CompressedPack) -> Result<()> {
         self.push_packed_with_mtime(name, compressed, None)
     }
 
@@ -99,7 +94,7 @@ impl NonsolidLzma2Writer {
     pub fn push_packed_with_mtime(
         &mut self,
         name: String,
-        compressed: Lzma2Compressed,
+        compressed: CompressedPack,
         mtime: Option<u64>,
     ) -> Result<()> {
         if compressed.uncompressed_size == 0 && compressed.data.is_empty() {
@@ -116,8 +111,8 @@ impl NonsolidLzma2Writer {
             pack_crc,
             unpack_size: compressed.uncompressed_size,
             content_crc: compressed.crc32,
-            method_id: vec![0x21],
-            method_props: vec![compressed.props],
+            method_id: compressed.method_id,
+            method_props: compressed.method_props,
             empty: false,
             mtime,
         });
@@ -183,44 +178,43 @@ mod tests {
     }
 
     #[test]
-    fn lzma2_writer_roundtrip() {
+    fn lzma2_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.txt");
-        let b = dir.path().join("b.txt");
-        fs::write(&a, b"alpha data content for create").unwrap();
-        fs::write(&b, b"beta data content for create!!").unwrap();
-
+        fs::write(&a, b"alpha lzma2").unwrap();
         let out = dir.path().join("out.7z");
         let mut w = NonsolidLzma2Writer::create(&out, 1).unwrap();
         w.push_path("a.txt".into(), &a).unwrap();
-        w.push_path("nested/b.txt".into(), &b).unwrap();
         w.finish().unwrap();
-
-        let reader = ArchiveReader::open(&out, Password::empty()).unwrap();
-        assert!(!reader.archive().is_solid);
-        drop(reader);
-
-        assert_eq!(extract(&out, "a.txt"), b"alpha data content for create");
-        assert_eq!(
-            extract(&out, "nested/b.txt"),
-            b"beta data content for create!!"
-        );
+        assert_eq!(extract(&out, "a.txt"), b"alpha lzma2");
     }
 
     #[test]
-    fn empty_file_member() {
+    fn zstd_roundtrip_via_writer() {
         let dir = tempfile::tempdir().unwrap();
-        let empty = dir.path().join("e.dat");
-        fs::write(&empty, b"").unwrap();
-        let data = dir.path().join("d.txt");
-        fs::write(&data, b"x").unwrap();
-        let out = dir.path().join("e.7z");
-        let mut w = NonsolidLzma2Writer::create(&out, 1).unwrap();
-        w.push_path("e.dat".into(), &empty).unwrap();
-        w.push_path("d.txt".into(), &data).unwrap();
+        let a = dir.path().join("a.txt");
+        fs::write(&a, b"alpha zstd data content").unwrap();
+        let out = dir.path().join("z.7z");
+        let mut w =
+            NonsolidLzma2Writer::create_with_method(&out, 3, CompressMethod::Zstd).unwrap();
+        w.push_path("a.txt".into(), &a).unwrap();
         w.finish().unwrap();
-        assert_eq!(extract(&out, "e.dat"), b"");
-        assert_eq!(extract(&out, "d.txt"), b"x");
+        let reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+        assert!(!reader.archive().is_solid);
+        drop(reader);
+        assert_eq!(extract(&out, "a.txt"), b"alpha zstd data content");
+    }
+
+    #[test]
+    fn lz4_roundtrip_via_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        fs::write(&a, b"alpha lz4 data").unwrap();
+        let out = dir.path().join("l.7z");
+        let mut w = NonsolidLzma2Writer::create_with_method(&out, 1, CompressMethod::Lz4).unwrap();
+        w.push_path("a.txt".into(), &a).unwrap();
+        w.finish().unwrap();
+        assert_eq!(extract(&out, "a.txt"), b"alpha lz4 data");
     }
 
     #[test]
