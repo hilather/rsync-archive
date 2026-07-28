@@ -74,7 +74,11 @@ jobs:
       - name: Install build dependencies
         run: |
           set -eux
-          dnf -y install gcc gcc-c++ make curl ca-certificates git openssl-devel pkgconf-pkg-config tar gzip
+          # Rocky 9+ ships curl-minimal (conflicts with package "curl").
+          dnf -y install gcc gcc-c++ make ca-certificates git openssl-devel pkgconf-pkg-config tar gzip
+          if ! command -v curl >/dev/null 2>&1; then
+            dnf -y install curl --allowerasing || dnf -y install curl-minimal
+          fi
 
       - uses: actions/checkout@v4
 

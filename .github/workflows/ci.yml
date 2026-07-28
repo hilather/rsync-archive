@@ -67,17 +67,19 @@ jobs:
       - name: Install build dependencies
         run: |
           set -eux
-          # Rocky 8 uses dnf modules; all have dnf.
+          # Rocky 9+ images ship curl-minimal (conflicts with package "curl").
+          # Install toolchain without pulling full curl; use --allowerasing only if needed.
           dnf -y install \
             gcc \
             gcc-c++ \
             make \
-            curl \
             ca-certificates \
             git \
             openssl-devel \
             pkgconf-pkg-config
-          # cmake not strictly required for default features; keep build tools lean.
+          if ! command -v curl >/dev/null 2>&1; then
+            dnf -y install curl --allowerasing || dnf -y install curl-minimal
+          fi
 
       - name: Checkout
         uses: actions/checkout@v4
