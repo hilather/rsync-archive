@@ -207,6 +207,19 @@ Details and parity table: [`docs/SELECTION.md`](docs/SELECTION.md).
 
 ---
 
+## Benchmarks
+
+Fair comparisons vs native tools (matched threads/levels where possible):
+
+```bash
+cargo build --release --bin rsync-archive --bin bench_compress
+./target/release/bench_compress run --scale small --threads 1,4 --level 1,5 --methods all
+```
+
+Docs: [`docs/BENCH.md`](docs/BENCH.md) · published numbers: [`docs/bench/RESULTS.md`](docs/bench/RESULTS.md)
+
+---
+
 ## Contributing / agents
 
 **Every behavior-changing change must update docs and include regression tests** in the same PR. See:

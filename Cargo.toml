@@ -13,6 +13,10 @@ categories = ["command-line-utilities", "compression"]
 name = "rsync-archive"
 path = "src/main.rs"
 
+[[bin]]
+name = "bench_compress"
+path = "src/bin/bench_compress.rs"
+
 [lib]
 name = "rsync_archive"
 path = "src/lib.rs"

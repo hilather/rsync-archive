@@ -8,3 +8,4 @@
 /fixtures/generated/
 /benchdata/
 *.partial
+/benchdata/
