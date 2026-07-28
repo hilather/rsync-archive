@@ -3,8 +3,8 @@
 //! Flag sets for `create` and `embed` follow `docs/DESIGN.md` (v1 freeze).
 //! Pipelines are stubbed until later stages.
 
-use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use clap::{Parser, Subcommand, ValueEnum};
+use std::path::{Path, PathBuf};
 
 /// Create non-solid 7z archives with rsync-style selection; embed finished archives.
 #[derive(Debug, Parser)]
@@ -25,18 +25,49 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Create a non-solid 7z from filesystem paths using rsync-style filters.
+    /// Create a non-solid 7z (or seekable-zstd stream) from filesystem paths using rsync-style filters.
     Create(CreateArgs),
     /// Embed finished archive files under a master non-solid store 7z (Copy method).
     Embed(EmbedArgs),
 }
 
+/// Output container format for `create`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum OutputFormat {
+    /// Non-solid 7z with per-file packs (default).
+    #[default]
+    #[value(name = "7z")]
+    SevenZ,
+    /// Single seekable-zstd stream with member index (byte-range access).
+    #[value(name = "seekable-zstd", alias = "zst")]
+    SeekableZstd,
+}
+
+impl OutputFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OutputFormat::SevenZ => "7z",
+            OutputFormat::SeekableZstd => "seekable-zstd",
+        }
+    }
+}
+
 /// Arguments for `rsync-archive create`.
 #[derive(Debug, Parser)]
 pub struct CreateArgs {
-    /// Output archive path (`.7z`).
+    /// Output archive path (`.7z` or `.zst`).
     #[arg(short = 'o', long = "output", value_name = "OUT")]
     pub output: PathBuf,
+
+    /// Output format: `7z` (default) or `seekable-zstd`.
+    /// If omitted, inferred from `-o` extension (`.zst` → seekable-zstd; else 7z).
+    #[arg(
+        long = "format",
+        visible_alias = "output-format",
+        value_name = "FMT",
+        value_enum
+    )]
+    pub format: Option<OutputFormat>,
 
     /// List what would be archived without writing.
     #[arg(short = 'n', long = "dry-run")]
@@ -70,28 +101,30 @@ pub struct CreateArgs {
     #[arg(long = "filter", value_name = "RULE", action = clap::ArgAction::Append)]
     pub filter: Vec<String>,
 
-    /// Compression level 0–9 (default 5). Meaning depends on `--method`
+    /// Compression level 0–9 (default 5). Meaning depends on format/`--method`
     /// (LZMA2 preset / mapped Zstd level; LZ4 ignores fine-grained levels).
     #[arg(long = "level", default_value_t = 5, value_parser = clap::value_parser!(u32).range(0..=9))]
     pub level: u32,
 
-    /// Compression method: `lzma2` (default), `zstd` (fast, strong ratio), or `lz4` (fastest).
+    /// Compression method for **7z** format only: `lzma2` (default), `zstd`, or `lz4`.
     /// All produce **non-solid** per-file packs (file-level random access).
+    /// Not used with `--format seekable-zstd` (error if set to a non-default value).
     #[arg(long = "method", default_value = "lzma2")]
     pub method: String,
 
     /// Encode worker count (archiveconverter-style). Omit for auto:
     /// many tiny files → 1; else available CPU parallelism.
+    /// Applies to **7z** create only.
     #[arg(long)]
     pub threads: Option<u32>,
 
     /// Max concurrent file encodes (`0` = auto from `--threads` / CPUs).
-    /// Same idea as archiveconverter `--nested-concurrency`.
+    /// Same idea as archiveconverter `--nested-concurrency`. **7z** only.
     #[arg(long = "encode-concurrency", default_value_t = 0)]
     pub encode_concurrency: usize,
 
     /// Max total **uncompressed** size of files encoding at once (default `500M`).
-    /// `0` = no size cap. Same default as archiveconverter `--nested-size-budget`.
+    /// `0` = no size cap. Same default as archiveconverter `--nested-size-budget`. **7z** only.
     #[arg(long = "encode-size-budget", default_value = "500M")]
     pub encode_size_budget: String,
 
@@ -161,11 +194,101 @@ impl CreateArgs {
         let has_files_from = self.files_from.is_some();
         let has_sources = !self.sources.is_empty();
         match (has_files_from, has_sources) {
-            (true, true) => Err(
-                "cannot combine --files-from with SRC... (use one or the other)".into(),
-            ),
-            (false, false) => Err("need SRC... or --files-from".into()),
-            _ => Ok(()),
+            (true, true) => {
+                return Err(
+                    "cannot combine --files-from with SRC... (use one or the other)".into(),
+                );
+            }
+            (false, false) => return Err("need SRC... or --files-from".into()),
+            _ => {}
         }
+
+        let format = self.resolved_format();
+        if format == OutputFormat::SeekableZstd {
+            // `--method` defaults to lzma2; only reject non-default values so
+            // seekable-zstd can be used without forcing users to omit --method.
+            if self.method != "lzma2" {
+                return Err(format!(
+                    "--method is for 7z format only (got --method {}); omit --method with --format seekable-zstd",
+                    self.method
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve output format: explicit `--format`, else infer from `-o` extension.
+    ///
+    /// - `.zst` → seekable-zstd
+    /// - otherwise → 7z (including `.7z` and extensionless paths)
+    pub fn resolved_format(&self) -> OutputFormat {
+        if let Some(f) = self.format {
+            return f;
+        }
+        infer_format_from_path(&self.output)
+    }
+}
+
+/// Infer create output format from the output path extension.
+pub fn infer_format_from_path(path: &Path) -> OutputFormat {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("zst") => OutputFormat::SeekableZstd,
+        _ => OutputFormat::SevenZ,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infer_zst_extension() {
+        assert_eq!(
+            infer_format_from_path(Path::new("out.zst")),
+            OutputFormat::SeekableZstd
+        );
+        assert_eq!(
+            infer_format_from_path(Path::new("out.ZST")),
+            OutputFormat::SeekableZstd
+        );
+        assert_eq!(
+            infer_format_from_path(Path::new("out.7z")),
+            OutputFormat::SevenZ
+        );
+        assert_eq!(
+            infer_format_from_path(Path::new("out")),
+            OutputFormat::SevenZ
+        );
+    }
+
+    #[test]
+    fn seekable_rejects_non_default_method() {
+        let args = CreateArgs {
+            output: PathBuf::from("o.zst"),
+            format: Some(OutputFormat::SeekableZstd),
+            dry_run: true,
+            force: false,
+            exclude: vec![],
+            include: vec![],
+            exclude_from: None,
+            include_from: None,
+            files_from: None,
+            filter: vec![],
+            level: 5,
+            method: "zstd".into(),
+            threads: None,
+            encode_concurrency: 0,
+            encode_size_budget: "500M".into(),
+            dir_max_size: vec![],
+            verify: false,
+            sources: vec![".".into()],
+        };
+        let err = args.validate().unwrap_err();
+        assert!(err.contains("--method"), "{err}");
     }
 }

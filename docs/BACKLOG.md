@@ -38,14 +38,18 @@ File-level random access via independent packs. Uses `zstd` (libzstd) and `lz4_f
 
 ### True seekable-Zstd single stream (optional)
 
-**Status:** Planned  
-**IDs:** `CODEC-ZSTD-SEEKABLE-STREAM`
+**Status:** **Done** (MVP) — `create --format seekable-zstd` / `-o *.zst`  
+**IDs:** `CODEC-ZSTD-SEEKABLE-STREAM`  
+**Docs:** [`FORMAT_SEEKABLE_ZSTD.md`](FORMAT_SEEKABLE_ZSTD.md)
 
 | Requirement | Detail |
 |-------------|--------|
 | Format | Zstd **seekable** multi-frame + seek table ([`zeekstd`](https://crates.io/crates/zeekstd)) |
-| Use case | Single huge blob / tar-like linear payload with byte-range reads |
-| Note | Distinct from per-file Zstd in non-solid 7z (already shipped) |
+| Payload | Length-prefixed members + trailing `RAZSIDX1` index (name → uncompressed data offset) |
+| Use case | Single stream with byte-range reads; list/extract helpers for verify/tests |
+| Note | Distinct from per-file Zstd in non-solid 7z (`--method zstd`) |
+
+**Follow-ups (not MVP):** full `extract` subcommand, tar-compatible payload, parallel encode for this format.
 ---
 
 ## Threading (archiveconverter parity)

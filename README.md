@@ -16,7 +16,7 @@
 
 | Command | Role |
 |---------|------|
-| **`create`** | Rsync-style include/exclude / files-from → **stream-read** sources → **stream-compress** (LZMA2) → single **non-solid** `.7z` |
+| **`create`** | Rsync-style include/exclude / files-from → **stream-read** sources → **stream-compress** → **non-solid** `.7z` (default) or **seekable-zstd** `.zst` |
 | **`embed`** | Take multiple finished files (typically `.7z`) → master/outer **non-solid store** 7z (Copy / method `0x00`), same idea as [archiveconverter](https://github.com/hilather/archiveconverter) outer append |
 
 **Create compresses; embed only stores.** Embed does **not** convert solid→non-solid (use archiveconverter for that).
@@ -27,7 +27,7 @@
 - **Disk-friendly:** no full tree copy to temp; stream read / stream compress / append packs.
 - **Rsync-style selection** for targeting, with `--dry-run` for testing filters.
 - **Safe output:** error if `-o` exists unless `--force`; write `OUT.partial` then rename (when pipelines land).
-- **Future formats** may share module layout; v1 is 7z only.
+- **Formats:** default **7z** non-solid; optional **seekable-zstd** for byte-range streams ([`docs/FORMAT_SEEKABLE_ZSTD.md`](docs/FORMAT_SEEKABLE_ZSTD.md)).
 
 ---
 
@@ -56,6 +56,10 @@ cargo run -- create -o out.7z --exclude '*.tmp' --level 5 --verify ./src/
 cargo run -- create -o out.7z -n --exclude '*.tmp' ./src/   # dry-run
 cargo run -- create -o out.7z --files-from list.txt
 
+# create seekable-zstd stream (byte-range access; infer from .zst or --format):
+cargo run -- create -o out.zst --format seekable-zstd --level 5 ./src/
+cargo run -- create -o pack.zst --level 3 ./data/           # .zst → seekable-zstd
+
 # embed finished files under a master store 7z:
 cargo run -- embed -o master.7z --allow-any a.bin b.bin
 cargo run -- embed -o master.7z --force --verify nest1.7z nest2.7z
@@ -76,7 +80,7 @@ rsync-archive create -o out.7z --force --level 1 /data/tree
 rsync-archive create -o o.7z --dir-max-size logs/=100M --dir-max-size cache=50M tree/
 ```
 
-**Write model:** non-solid 7z, **per-file packs** (file-level random access):
+**Write model (default `--format 7z`):** non-solid 7z, **per-file packs** (file-level random access):
 
 | `--method` | Codec | Notes |
 |------------|--------|--------|
@@ -86,7 +90,9 @@ rsync-archive create -o o.7z --dir-max-size logs/=100M --dir-max-size cache=50M 
 
 Empty files use empty flags; mtime from source; `OUT.partial` → rename. Parallel encode: AC-style workers + **500M** budget.
 
-**Still backlog:** true single-stream **seekable-zstd** (zeekstd) for tar-like blobs — [`docs/BACKLOG.md`](docs/BACKLOG.md).
+**`--format seekable-zstd`:** single Zstd **seekable** stream (zeekstd) with length-prefixed members + trailer index for name → uncompressed offset. Infer from `-o *.zst` when `--format` omitted. `--method` is 7z-only (error if non-default with seekable-zstd). Layout: [`docs/FORMAT_SEEKABLE_ZSTD.md`](docs/FORMAT_SEEKABLE_ZSTD.md).
+
+Default create remains **non-solid 7z** with **`--method lzma2`**.
 
 **Trailing `/` on SRC** strips the directory name from archive paths (`photos/` → `a.jpg`; `photos` → `photos/a.jpg`).  
 **`--files-from`:** exclusive of `SRC...`; relative lines keep path as member name; absolute lines use basename.  
@@ -118,7 +124,8 @@ Default naming flattens to **basename**. Missing 7z magic **warns** (stderr log)
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `-o`, `--output` | required | Output `.7z` |
+| `-o`, `--output` | required | Output path (`.7z` or `.zst`) |
+| `--format` / `--output-format` | infer / `7z` | `7z` · `seekable-zstd` (`.zst` extension → seekable-zstd) |
 | `-n`, `--dry-run` | off | List selection only |
 | `--force` | off | Overwrite existing `-o` |
 | `--exclude` / `--include` | — | Rsync-style patterns (repeatable) |
@@ -126,10 +133,10 @@ Default naming flattens to **basename**. Missing 7z magic **warns** (stderr log)
 | `--files-from` | — | Explicit file list (exclusive of `SRC...`) |
 | `--filter` | — | `+ pattern` / `- pattern` (repeatable) |
 | `--level` | `5` | Level 0–9 (LZMA2 preset / mapped Zstd; LZ4 mostly ignores) |
-| `--method` | `lzma2` | `lzma2` · `zstd` · `lz4` (non-solid per-file packs) |
-| `--threads` | auto | Encode workers (omit = auto: many tiny files → 1, else CPUs) |
-| `--encode-concurrency` | `0` | Max concurrent encodes (`0` = auto from threads) |
-| `--encode-size-budget` | `500M` | Max in-flight uncompressed size (`0` = unlimited) |
+| `--method` | `lzma2` | **7z only:** `lzma2` · `zstd` · `lz4` (non-solid per-file packs) |
+| `--threads` | auto | **7z only:** encode workers (omit = auto: many tiny files → 1, else CPUs) |
+| `--encode-concurrency` | `0` | **7z only:** max concurrent encodes (`0` = auto from threads) |
+| `--encode-size-budget` | `500M` | **7z only:** max in-flight uncompressed size (`0` = unlimited) |
 | `--dir-max-size` | — | Cap selected bytes under archive-relative dir (`PATH=SIZE`, repeatable; newest-first) |
 | `--verify` | off | Post-write test |
 | `SRC...` | — | Sources (required unless `--files-from`) |
@@ -169,7 +176,7 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for stages and PR plan.
 | 8 Parallel encode (AC-style threads) | **Done** — `--threads` / `--encode-concurrency` / `--encode-size-budget 500M` |
 | 7 Verify + acceptance | Planned |
 | Codec: Zstd + LZ4 in 7z | **Done** — `--method zstd|lz4` (file-level RA) |
-| True seekable-zstd stream (zeekstd) | **Backlog** — single-blob tar-like |
+| True seekable-zstd stream (zeekstd) | **Done** — `--format seekable-zstd` / `-o *.zst` ([`docs/FORMAT_SEEKABLE_ZSTD.md`](docs/FORMAT_SEEKABLE_ZSTD.md)) |
 | 9 Directory size budgets (newest-first) | **Done** — `--dir-max-size PATH=SIZE` (post-filter; longest prefix) |
 ---
 
@@ -178,21 +185,22 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for stages and PR plan.
 ```text
 src/
   main.rs, cli.rs, lib.rs, error.rs
-  archive/sevenz/    # non-solid header + NonsolidStoreWriter (Copy) for embed
-  select/            # SourceSpec, pathnorm, rules, matcher, from_file, walk
-  pipeline/output.rs # partial path, --force check, rename helpers
-  pipeline/create.rs # create selection + LZMA2 write
-  pipeline/embed.rs  # embed command (store outer)
-  archive/sevenz/    # header, store_writer, lzma2_writer, codec
-  util/              # tracing init
+  archive/sevenz/         # non-solid header + store + create writers
+  archive/seekable_zstd/  # seekable-zstd create + list/extract helpers
+  select/                 # SourceSpec, pathnorm, rules, matcher, from_file, walk
+  pipeline/output.rs      # partial path, --force check, rename helpers
+  pipeline/create.rs      # create selection + 7z / seekable-zstd write
+  pipeline/embed.rs       # embed command (store outer)
+  util/                   # tracing init
 docs/
-  DESIGN.md          # full design
-  SELECTION.md       # filter semantics (Stage 4, frozen v1)
-AGENTS.md            # mandatory agent policy (docs + tests)
+  DESIGN.md               # full design
+  SELECTION.md            # filter semantics (Stage 4, frozen v1)
+  FORMAT_SEEKABLE_ZSTD.md # seekable-zstd on-disk layout
+AGENTS.md                 # mandatory agent policy (docs + tests)
 .grok/skills/
   keep-docs-current/
   keep-tests-current/
-tests/               # cli_smoke, filter_parity
+tests/                    # cli_smoke, e2e_create, e2e_seekable_zstd, filter_parity
 ```
 
 ### Selection (Stage 4)

@@ -633,6 +633,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "walkdir",
+ "zeekstd",
  "zstd",
 ]
 
@@ -995,6 +996,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "zeekstd"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5f1379c45a7b52ed4aa3442da2cf5cc39abf1d8d178a5c02797be29c072ede2"
+dependencies = [
+ "zstd-safe",
 ]
 
 [[package]]

@@ -1,15 +1,18 @@
-//! Create pipeline: selection, dry-run, and LZMA2 non-solid write.
+//! Create pipeline: selection, dry-run, and non-solid 7z or seekable-zstd write.
 //!
-//! Parallel encode (archiveconverter-style):
+//! Parallel encode (archiveconverter-style) for **7z** format:
 //! - `--threads` omit = auto (many tiny files → 1 worker; else CPU count)
 //! - `--encode-concurrency 0` = auto from threads
 //! - `--encode-size-budget` default `500M` (in-flight uncompressed bytes)
+//!
+//! **seekable-zstd** streams members into a zeekstd encoder (see
+//! `docs/FORMAT_SEEKABLE_ZSTD.md`).
 
 use crate::archive::sevenz::{
     compress_path, filetime_from_unix_secs, CompressedPack, CompressMethod,
 };
-use crate::archive::NonsolidLzma2Writer;
-use crate::cli::CreateArgs;
+use crate::archive::{write_seekable_zstd, NonsolidLzma2Writer};
+use crate::cli::{CreateArgs, OutputFormat};
 use crate::error::{Error, Result};
 use crate::pipeline::output::{cleanup_partial, commit_output, prepare_output};
 use crate::select::dir_budget::{apply_dir_budgets, parse_dir_budgets};
@@ -80,8 +83,9 @@ pub fn build_selection(args: &CreateArgs) -> Result<(Vec<SelectedEntry>, Selecti
 /// Run `rsync-archive create`.
 ///
 /// Dry-run lists archive names and exit 0 even when empty.
-/// Write builds a non-solid LZMA2 7z via partial+rename.
+/// Write builds a non-solid 7z or seekable-zstd stream via partial+rename.
 pub fn run_create(args: CreateArgs) -> Result<()> {
+    let format = args.resolved_format();
     let (entries, stats) = build_selection(&args)?;
 
     if args.dry_run {
@@ -90,6 +94,7 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
         }
         print_selection_summary(&stats, true);
         info!(
+            format = format.as_str(),
             selected = stats.selected,
             skipped_excluded = stats.skipped_excluded,
             skipped_dir_budget = stats.skipped_dir_budget,
@@ -104,6 +109,17 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
         return Err(Error::EmptyArchive);
     }
 
+    match format {
+        OutputFormat::SevenZ => run_create_sevenz(&args, &entries, &stats),
+        OutputFormat::SeekableZstd => run_create_seekable_zstd(&args, &entries, &stats),
+    }
+}
+
+fn run_create_sevenz(
+    args: &CreateArgs,
+    entries: &[SelectedEntry],
+    stats: &SelectionStats,
+) -> Result<()> {
     let method = CompressMethod::parse(&args.method)?;
     let (n, total_bytes) = file_stats_from_sizes(entries.iter().map(|e| e.size));
     let workers = resolve_encode_workers(args.threads, n, total_bytes);
@@ -111,6 +127,7 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
     let size_budget = parse_byte_size(&args.encode_size_budget)?;
 
     info!(
+        format = "7z",
         method = method.as_str(),
         workers,
         concurrency,
@@ -123,7 +140,7 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
     let paths = prepare_output(&args.output, args.force)?;
     match write_create_archive(
         &paths.partial_path,
-        &entries,
+        entries,
         args.level,
         method,
         concurrency,
@@ -131,7 +148,7 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
     ) {
         Ok(()) => {
             commit_output(&paths)?;
-            print_selection_summary(&stats, false);
+            print_selection_summary(stats, false);
             info!(
                 path = %paths.final_path.display(),
                 count = entries.len(),
@@ -141,7 +158,7 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
                 "create complete"
             );
             eprintln!(
-                "created {} member(s) → {} (method {}, concurrency {})",
+                "created {} member(s) → {} (format 7z, method {}, concurrency {})",
                 entries.len(),
                 paths.final_path.display(),
                 method.as_str(),
@@ -149,6 +166,51 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
             );
             if args.verify {
                 verify_create_archive(&paths.final_path, entries.len())?;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            cleanup_partial(&paths);
+            Err(e)
+        }
+    }
+}
+
+fn run_create_seekable_zstd(
+    args: &CreateArgs,
+    entries: &[SelectedEntry],
+    stats: &SelectionStats,
+) -> Result<()> {
+    info!(
+        format = "seekable-zstd",
+        level = args.level,
+        file_count = entries.len(),
+        "create seekable-zstd"
+    );
+
+    let paths = prepare_output(&args.output, args.force)?;
+    match write_seekable_zstd(&paths.partial_path, entries, args.level) {
+        Ok(()) => {
+            commit_output(&paths)?;
+            print_selection_summary(stats, false);
+            info!(
+                path = %paths.final_path.display(),
+                count = entries.len(),
+                level = args.level,
+                "create seekable-zstd complete"
+            );
+            eprintln!(
+                "created {} member(s) → {} (format seekable-zstd, level {})",
+                entries.len(),
+                paths.final_path.display(),
+                args.level
+            );
+            if args.verify {
+                crate::archive::verify_seekable_zstd(&paths.final_path, entries.len())?;
+                eprintln!(
+                    "verify ok: {} member(s), seekable-zstd",
+                    entries.len()
+                );
             }
             Ok(())
         }
@@ -375,6 +437,7 @@ pub(crate) fn test_create_args(
 ) -> CreateArgs {
     CreateArgs {
         output,
+        format: None,
         dry_run: true,
         force: false,
         exclude: vec![],
@@ -639,5 +702,73 @@ mod tests {
             ["logs/a.bin", "logs/nested/b.bin"].into_iter().collect()
         );
         assert_eq!(stats.skipped_dir_budget, 1);
+    }
+
+    #[test]
+    fn create_seekable_zstd_roundtrip() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("tree");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("a.txt"), b"hello zst").unwrap();
+        fs::write(root.join("sub/b.txt"), b"nested zst").unwrap();
+        fs::write(root.join("empty.dat"), b"").unwrap();
+
+        let out = dir.path().join("out.zst");
+        let mut args = test_create_args(out.clone(), vec![format!("{}/", root.display())]);
+        args.dry_run = false;
+        args.level = 1;
+        args.verify = true;
+        // format inferred from .zst
+        run_create(args).unwrap();
+
+        assert!(out.exists());
+        assert!(!dir.path().join("out.zst.partial").exists());
+
+        let index = crate::archive::list_members(&out).unwrap();
+        let mut names: Vec<_> = index.names().map(|s| s.to_string()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a.txt", "empty.dat", "sub/b.txt"]);
+        assert_eq!(
+            crate::archive::extract_member_bytes(&out, "a.txt").unwrap(),
+            b"hello zst"
+        );
+        assert_eq!(
+            crate::archive::extract_member_bytes(&out, "sub/b.txt").unwrap(),
+            b"nested zst"
+        );
+        assert_eq!(
+            crate::archive::extract_member_bytes(&out, "empty.dat").unwrap(),
+            b""
+        );
+    }
+
+    #[test]
+    fn create_seekable_zstd_dry_run_no_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("tree");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"x").unwrap();
+        let out = dir.path().join("out.zst");
+        let mut args = test_create_args(out.clone(), vec![format!("{}/", root.display())]);
+        args.dry_run = true;
+        args.format = Some(OutputFormat::SeekableZstd);
+        run_create(args).unwrap();
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn create_default_still_sevenz_lzma2() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        fs::write(&f, b"default-7z").unwrap();
+        let out = dir.path().join("out.7z");
+        let mut args = test_create_args(out.clone(), vec![f.to_string_lossy().into()]);
+        args.dry_run = false;
+        args.level = 1;
+        // no --format; default 7z
+        run_create(args).unwrap();
+        let mut reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+        assert!(!reader.archive().is_solid);
+        assert_eq!(reader.read_file("a.txt").unwrap(), b"default-7z");
     }
 }

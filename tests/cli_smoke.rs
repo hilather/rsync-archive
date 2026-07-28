@@ -31,7 +31,9 @@ fn create_help_shows_key_flags() {
         .stdout(predicate::str::contains("--threads"))
         .stdout(predicate::str::contains("--encode-size-budget"))
         .stdout(predicate::str::contains("--dir-max-size"))
-        .stdout(predicate::str::contains("--method"));
+        .stdout(predicate::str::contains("--method"))
+        .stdout(predicate::str::contains("--format"))
+        .stdout(predicate::str::contains("seekable-zstd"));
 }
 
 #[test]
@@ -162,6 +164,7 @@ fn create_validate_unit_rejects_both_modes() {
 
     let args = CreateArgs {
         output: PathBuf::from("out.7z"),
+        format: None,
         dry_run: false,
         force: false,
         exclude: vec![],
@@ -189,6 +192,7 @@ fn create_validate_unit_accepts_sources_only() {
 
     let args = CreateArgs {
         output: PathBuf::from("out.7z"),
+        format: None,
         dry_run: false,
         force: false,
         exclude: vec![],

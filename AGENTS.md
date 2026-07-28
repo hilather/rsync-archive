@@ -128,8 +128,9 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | `src/pipeline/create.rs` | **`create` selection + LZMA2 write** (partial+rename, verify) |
 | `src/archive/sevenz/lzma2_writer.rs` | `NonsolidLzma2Writer` — non-solid create packs |
 | `src/archive/sevenz/codec.rs` | LZMA2 stream encode helpers |
+| `src/archive/seekable_zstd/` | Seekable-zstd create + member index list/extract |
 | `src/util/` | Tracing init (`-v` / `-vv`) |
-| `src/archive/mod.rs` | Archive module root; re-exports store writer API |
+| `src/archive/mod.rs` | Archive module root; re-exports store + seekable-zstd API |
 | `src/archive/sevenz/header.rs` | `HeaderFile`, `write_raw_header`, `write_start_header`, empty bits, names, mtime, attrs |
 | `src/archive/sevenz/store_writer.rs` | `NonsolidStoreWriter` (Copy `0x00`) — embed foundation |
 | `src/archive/sevenz/` | Headers + store writer; LZMA2 create writer (later) |
