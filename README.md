@@ -4,7 +4,7 @@
 
 | | |
 |--|--|
-| **Status** | Stage 0 complete; create/embed pipelines not implemented yet |
+| **Status** | Stage 1 complete; create/embed pipelines not implemented yet |
 | **License** | MIT |
 | **Design** | [`docs/DESIGN.md`](docs/DESIGN.md) |
 | **Agent policy** | [`AGENTS.md`](AGENTS.md) (docs **and** tests required on every change) |
@@ -84,7 +84,7 @@ rsync-archive embed -o master.7z --require-7z --verify a.7z b.7z
 
 | Flag | Meaning |
 |------|---------|
-| `-v` / `-vv` | Debug / trace logging |
+| `-v` / `-vv` | Debug / trace logging on stderr (`info` → `debug` → `trace`; `RUST_LOG` overrides) |
 
 ### `create`
 
@@ -126,7 +126,7 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for stages and PR plan.
 | Stage | Status |
 |-------|--------|
 | 0 Bootstrap + agent docs/tests policy | **Done** |
-| 1 Foundations (errors, pathnorm, output helpers) | Planned |
+| 1 Foundations (errors, pathnorm, output helpers) | **Done** |
 | 2 7z header + store writer | Planned |
 | 3 Embed pipeline | Planned |
 | 4 Rsync filter engine | Planned |
@@ -142,7 +142,10 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for stages and PR plan.
 ```text
 src/
   main.rs, cli.rs, lib.rs, error.rs
-  # later: select/, archive/sevenz/, pipeline/
+  select/            # SourceSpec, pathnorm (filters/walk later)
+  pipeline/output.rs # partial path, --force check, rename helpers
+  util/              # tracing init
+  # later: archive/sevenz/, pipeline/{create,embed}
 docs/
   DESIGN.md          # full design
   SELECTION.md       # filter semantics (Stage 4)
@@ -150,7 +153,7 @@ AGENTS.md            # mandatory agent policy (docs + tests)
 .grok/skills/
   keep-docs-current/
   keep-tests-current/
-tests/               # e2e and parity tests (later stages)
+tests/               # cli_smoke + later e2e/parity
 ```
 
 ---

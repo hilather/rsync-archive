@@ -112,12 +112,15 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | `src/cli.rs` | Clap surface — source of truth for flags |
 | `src/error.rs` | Error types |
 | `src/main.rs` | Binary entry, exit codes |
-| `src/select/` | Rsync filters + walk (later stages) |
+| `src/select/pathnorm.rs` | Archive path normalization; reject `..` |
+| `src/select/mod.rs` | `SourceSpec`, archive name mapping (filters/walk later) |
+| `src/pipeline/output.rs` | `*.partial` naming, `--force` check, rename commit |
+| `src/util/` | Tracing init (`-v` / `-vv`) |
 | `src/archive/sevenz/` | Headers, store writer, LZMA2 create (later) |
-| `src/pipeline/` | create / embed / output / verify (later) |
+| `src/pipeline/` | create / embed / verify (later) |
 | `docs/DESIGN.md` | Full design (stages, decisions) |
 | `docs/SELECTION.md` | Filter semantics (Stage 4+) |
-| `tests/` | e2e and parity |
+| `tests/` | e2e and parity (`cli_smoke` now) |
 | `.grok/skills/keep-docs-current/` | Docs sync skill |
 | `.grok/skills/keep-tests-current/` | Regression test skill |
 

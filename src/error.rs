@@ -15,6 +15,15 @@ pub enum Error {
     #[error("{0}")]
     Message(String),
 
+    #[error("CLI: {0}")]
+    Cli(String),
+
+    #[error("selection: {0}")]
+    Selection(String),
+
+    #[error("archive: {0}")]
+    Archive(String),
+
     #[error("output already exists: {0} (use --force to overwrite)")]
     OutputExists(PathBuf),
 
@@ -29,7 +38,23 @@ pub enum Error {
 
     #[error("invalid member name: {0}")]
     InvalidMemberName(String),
+
+    #[error("filter file too large: {path} ({detail})")]
+    FilterFileTooLarge { path: PathBuf, detail: String },
+
+    #[error("not a regular file: {0}")]
+    NotRegularFile(PathBuf),
+
+    #[error("invalid UTF-8 path: {0}")]
+    InvalidUtf8Path(String),
 }
 
 /// Convenient result alias.
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    /// Build a message error from a displayable value.
+    pub fn msg(s: impl Into<String>) -> Self {
+        Error::Message(s.into())
+    }
+}

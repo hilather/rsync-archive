@@ -2,8 +2,8 @@
 
 use clap::Parser;
 use rsync_archive::cli::{Cli, Command};
+use rsync_archive::util;
 use rsync_archive::Error;
-use tracing_subscriber::EnvFilter;
 
 fn main() {
     let code = match run() {
@@ -27,7 +27,7 @@ enum ExitError {
 
 fn run() -> std::result::Result<(), ExitError> {
     let cli = Cli::parse();
-    init_tracing(cli.verbose);
+    util::init_tracing(cli.verbose);
 
     match cli.command {
         Command::Create(args) => {
@@ -40,19 +40,4 @@ fn run() -> std::result::Result<(), ExitError> {
             "embed (Stage 3)",
         ))),
     }
-}
-
-fn init_tracing(verbose: u8) {
-    let default = match verbose {
-        0 => "info",
-        1 => "debug",
-        _ => "trace",
-    };
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default));
-    // Ignore double-init in tests.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
 }
