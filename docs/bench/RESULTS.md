@@ -1,77 +1,73 @@
-# Compression bench results
+# Compression bench results (non-solid only)
 
-Host: Linux laptop, **12** threads available. Date: **2026-07-28**.  
-Harness: `bench_compress` · binaries release-built · fixtures under `benchdata/` (gitignored).
+Host: Linux, **12** cores. Date: **2026-07-28**.  
+Harness: `bench_compress` (release). **No solid tar streams.**
 
 ## Fairness
 
-| Method | Ours | Native | Same |
-|--------|------|--------|------|
-| lzma2 | non-solid `.7z` | `7zz` non-solid LZMA2 `-ms=off -mmt=N -mx=L` | container + codec + threads + level |
-| zstd | non-solid `.7z`+Zstd packs | `tar \| zstd -T N` solid `.tar.zst` | threads + mapped level only |
-| lz4 | non-solid `.7z`+LZ4 | `tar \| lz4` solid stream | level; lz4 CLI usually single-thread |
+| Method | Ours | Native (non-solid) |
+|--------|------|---------------------|
+| lzma2 | non-solid 7z + LZMA2 | **7zz** non-solid LZMA2 (`-ms=off`) |
+| zstd | non-solid 7z + Zstd packs | **zstd CLI per file** (≤N workers) + **7zz Copy** non-solid |
+| lz4 | non-solid 7z + LZ4 packs | **lz4 CLI per file** (≤N workers) + **7zz Copy** non-solid |
 
-**Important:** zstd/lz4 native baselines are **solid streams** (better ratio, no per-file random access). Ours always pays for **non-solid multi-member** layout (headers + independent packs).
+## Scale: tiny (~200 files, ~1.7 MiB)
 
-## Scale: tiny (~200 files, ~1.7 MiB compressible text)
-
-| method | tool | threads | level | sec | out_MiB | ratio | MiB/s |
-|--------|------|--------:|------:|----:|--------:|------:|------:|
-| lzma2 | **rsync-archive** | 1 | 1 | 0.131 | 0.048 | 34.4 | 12.7 |
-| lzma2 | 7zz-LZMA2 | 1 | 1 | 0.081 | 0.037 | 44.6 | 20.4 |
-| lzma2 | **rsync-archive** | 4 | 1 | **0.044** | 0.048 | 34.4 | **37.8** |
-| lzma2 | 7zz-LZMA2 | 4 | 1 | 0.077 | 0.037 | 44.6 | 21.6 |
-| lzma2 | rsync-archive | 1 | 5 | 0.384 | 0.048 | 34.4 | 4.3 |
-| lzma2 | **7zz-LZMA2** | 1 | 5 | **0.136** | **0.037** | **44.6** | 12.2 |
-| lzma2 | rsync-archive | 4 | 5 | 0.213 | 0.048 | 34.4 | 7.8 |
-| lzma2 | **7zz-LZMA2** | 4 | 5 | **0.111** | **0.037** | **44.6** | 15.0 |
-| zstd | rsync-archive | 1 | 1 | 0.013 | 0.044 | 37.6 | 132 |
-| zstd | tar\|zstd (solid) | 1 | 1 | 0.011 | 0.015 | 109 | 152 |
-| zstd | rsync-archive | 4 | 1 | 0.031 | 0.044 | 37.6 | 54 |
-| zstd | tar\|zstd (solid) | 4 | 1 | 0.009 | 0.015 | 109 | 175 |
-| zstd | rsync-archive | 1 | 5 | 0.077 | 0.044 | 37.5 | 21 |
-| zstd | tar\|zstd (solid) | 1 | 5 | 0.017 | 0.015 | 112 | 95 |
-| lz4 | rsync-archive | 1 | 1 | 0.015 | 0.052 | 31.9 | 110 |
-| lz4 | tar\|lz4 (solid) | 1 | 1 | 0.010 | 0.024 | 69.6 | 162 |
-| lz4 | rsync-archive | 1 | 5 | 0.016 | 0.052 | 31.9 | 106 |
-| lz4 | tar\|lz4 (solid) | 1 | 5 | 0.016 | 0.022 | 74.5 | 103 |
+| method | tool | t | level | sec | out_MiB | ratio | MiB/s |
+|--------|------|--:|------:|----:|--------:|------:|------:|
+| lzma2 | rsync-archive | 1 | 1 | 0.176 | 0.048 | 34.4 | 9.4 |
+| lzma2 | **7zz-LZMA2** | 1 | 1 | **0.055** | **0.037** | **44.6** | 29.9 |
+| lzma2 | **rsync-archive** | 4 | 1 | **0.098** | 0.048 | 34.4 | 17.0 |
+| lzma2 | 7zz-LZMA2 | 4 | 1 | 0.195 | 0.037 | 44.6 | 8.5 |
+| lzma2 | rsync-archive | 1 | 5 | 0.531 | 0.048 | 34.4 | 3.1 |
+| lzma2 | **7zz-LZMA2** | 1 | 5 | **0.107** | **0.037** | **44.6** | 15.5 |
+| lzma2 | rsync-archive | 4 | 5 | 0.433 | 0.048 | 34.4 | 3.8 |
+| lzma2 | **7zz-LZMA2** | 4 | 5 | **0.281** | **0.037** | **44.6** | 5.9 |
+| zstd | **rsync-archive** | 1 | 1 | **0.042** | 0.044 | 37.6 | **39** |
+| zstd | zstd+7zz-Copy | 1 | 1 | 0.486 | **0.032** | **51.2** | 3.4 |
+| zstd | **rsync-archive** | 4 | 1 | **0.026** | 0.044 | 37.6 | **63** |
+| zstd | zstd+7zz-Copy | 4 | 1 | 0.180 | **0.032** | **51.3** | 9.2 |
+| zstd | **rsync-archive** | 1 | 5 | **0.050** | 0.044 | 37.5 | **33** |
+| zstd | zstd+7zz-Copy | 1 | 5 | 0.402 | **0.032** | **51.1** | 4.1 |
+| lz4 | **rsync-archive** | 1 | 1 | **0.038** | 0.052 | 31.9 | **44** |
+| lz4 | lz4+7zz-Copy | 1 | 1 | 0.680 | **0.040** | **41.1** | 2.4 |
+| lz4 | **rsync-archive** | 4 | 1 | **0.075** | 0.052 | 31.9 | 22 |
+| lz4 | lz4+7zz-Copy | 4 | 1 | 0.257 | **0.040** | **41.2** | 6.5 |
 
 ## Scale: small (~2k files, ~20 MiB)
 
-| method | tool | threads | level | sec | out_MiB | ratio | MiB/s |
-|--------|------|--------:|------:|----:|--------:|------:|------:|
-| lzma2 | rsync-archive | 1 | 1 | 0.715 | 0.321 | 60.9 | 27.3 |
-| lzma2 | **7zz-LZMA2** | 1 | 1 | **0.517** | **0.209** | **93.5** | 37.7 |
-| lzma2 | **rsync-archive** | 4 | 1 | **0.287** | 0.321 | 60.9 | **68.0** |
-| lzma2 | 7zz-LZMA2 | 4 | 1 | 0.573 | 0.209 | 93.5 | 34.1 |
-| lzma2 | rsync-archive | 1 | 5 | 2.739 | 0.321 | 60.9 | 7.1 |
-| lzma2 | **7zz-LZMA2** | 1 | 5 | **1.123** | **0.209** | **93.5** | 17.4 |
-| lzma2 | rsync-archive | 4 | 5 | 1.600 | 0.321 | 60.9 | 12.2 |
-| lzma2 | **7zz-LZMA2** | 4 | 5 | **0.653** | **0.209** | **93.5** | 29.9 |
-| zstd | rsync-archive | 1 | 1 | 0.070 | 0.273 | 71.5 | 277 |
-| zstd | tar\|zstd (solid) | 1 | 1 | 0.037 | 0.023 | 859 | 523 |
-| zstd | rsync-archive | 4 | 1 | 0.193 | 0.273 | 71.5 | 102 |
-| zstd | tar\|zstd (solid) | 4 | 1 | 0.034 | 0.023 | 859 | 573 |
-| zstd | rsync-archive | 1 | 5 | 0.387 | 0.273 | 71.5 | 50 |
-| zstd | tar\|zstd (solid) | 1 | 5 | 0.051 | 0.018 | 1091 | 383 |
-| lz4 | rsync-archive | 1 | 1 | 0.100 | 0.357 | 54.7 | 195 |
-| lz4 | tar\|lz4 (solid) | 1 | 1 | 0.045 | 0.112 | 174 | 430 |
-| lz4 | rsync-archive | 1 | 5 | 0.099 | 0.357 | 54.7 | 197 |
-| lz4 | tar\|lz4 (solid) | 1 | 5 | 0.094 | 0.100 | 195 | 207 |
+| method | tool | t | level | sec | out_MiB | ratio | MiB/s |
+|--------|------|--:|------:|----:|--------:|------:|------:|
+| lzma2 | rsync-archive | 1 | 1 | 1.01 | 0.321 | 60.9 | 19 |
+| lzma2 | **7zz-LZMA2** | 1 | 1 | **0.66** | **0.209** | **93.5** | 30 |
+| lzma2 | rsync-archive | 4 | 1 | 0.99 | 0.321 | 60.9 | 20 |
+| lzma2 | **7zz-LZMA2** | 4 | 1 | **0.73** | **0.209** | **93.5** | 27 |
+| lzma2 | rsync-archive | 1 | 5 | 3.42 | 0.321 | 60.9 | 5.7 |
+| lzma2 | **7zz-LZMA2** | 1 | 5 | **1.28** | **0.209** | **93.5** | 15 |
+| lzma2 | rsync-archive | 4 | 5 | 3.55 | 0.321 | 60.9 | 5.5 |
+| lzma2 | **7zz-LZMA2** | 4 | 5 | **2.40** | **0.209** | **93.5** | 8.1 |
+| zstd | **rsync-archive** | 1 | 1 | **0.07** | 0.273 | 71.5 | **270** |
+| zstd | zstd+7zz-Copy | 1 | 1 | 7.73 | **0.154** | **127** | 2.5 |
+| zstd | **rsync-archive** | 4 | 1 | **0.49** | 0.273 | 71.5 | 40 |
+| zstd | zstd+7zz-Copy | 4 | 1 | 2.59 | **0.154** | **127** | 7.6 |
+| zstd | **rsync-archive** | 1 | 5 | **0.46** | 0.273 | 71.5 | **43** |
+| zstd | zstd+7zz-Copy | 1 | 5 | 5.61 | **0.154** | **127** | 3.5 |
+| lz4 | **rsync-archive** | 1 | 1 | **0.11** | 0.357 | 54.7 | **180** |
+| lz4 | lz4+7zz-Copy | 1 | 1 | 4.15 | **0.240** | **81** | 4.7 |
+| lz4 | **rsync-archive** | 4 | 1 | **0.69** | 0.357 | 54.7 | 28 |
+| lz4 | lz4+7zz-Copy | 4 | 1 | 2.04 | **0.240** | **81** | 9.6 |
 
-## Takeaways
+## Takeaways (non-solid peers)
 
-1. **lzma2 vs 7zz (fair non-solid 7z):** Official **7zz is smaller and often faster at level 5**; at **level 1 with 4 threads**, **rsync-archive can win on wall time** (parallel file encode). Ratio gap ~1.3–1.5× in 7zz’s favor (better LZMA2 + packing).
-2. **Parallelism helps us on multi-file trees** more than 7zz at low level (our encode workers vs 7zz `-mmt` on small files).
-3. **zstd/lz4 solid native streams crush size** (one solid stream of repeated text). Our larger outputs buy **per-file random access** in 7z.
-4. **Within our tool**, prefer **`--method zstd`** for speed; **lzma2** for size; **lz4** when encode latency matters most.
+1. **lzma2 vs 7zz (true peer):** 7zz still **smaller** (~1.3–1.5×) and usually **faster**, especially at level 5. Our multi-worker encode sometimes wins wall time at low level / tiny sets.
+2. **zstd/lz4 vs CLI+Copy proxy:** We are **much faster** (in-process encode vs thousands of process spawns + second 7zz pass). Native proxy still **smaller** (libzstd/lz4 CLI + lean store outer).
+3. Process-spawn proxy is a **harsh** but fair **layout** peer; installing **7-Zip-zstd** would enable a true `-m0=zstd/-m0=lz4 -ms=off` peer later.
+4. Within our tool, **`--method zstd`** remains the throughput pick; **lzma2** the size pick.
 
 ## Reproduce
 
 ```bash
 cargo build --release --bin rsync-archive --bin bench_compress
-export PATH="$HOME/.local/bin:$PATH"   # 7zz
+export PATH="$HOME/.local/bin:$PATH"
 ./target/release/bench_compress run --scale small --threads 1,4 --level 1,5 --methods all
 ```
-
-See also [`docs/BENCH.md`](../BENCH.md).

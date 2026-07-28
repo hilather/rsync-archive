@@ -1,42 +1,40 @@
-# Compression benchmarks
+# Compression benchmarks (non-solid only)
 
-Compare **rsync-archive** to native tools under matched threads and levels.
+Compare **rsync-archive** to native tools using **only non-solid multi-member** archives.
+
+Solid `tar|zstd` / `tar|lz4` streams are **not** used — they are a different product (no per-file random access).
 
 ## Fairness matrix
 
-| Method | Our tool | Native baseline | Matched knobs | Caveat |
-|--------|----------|-----------------|---------------|--------|
-| **lzma2** | `create --method lzma2` → non-solid `.7z` | `7zz a -t7z -m0=LZMA2 -ms=off -mmt=N -mx=L` | threads, level, non-solid | Closest apples-to-apples |
-| **zstd** | `create --method zstd` → non-solid `.7z` | `tar \| zstd -T N -L` → `.tar.zst` | threads, mapped zstd level | Native is **solid stream** (no per-file random access) |
-| **lz4** | `create --method lz4` → non-solid `.7z` | `tar \| lz4 -L` → `.tar.lz4` | level; threads often N/A for lz4 CLI | Native solid stream; classic `lz4` is typically single-thread |
+| Method | Our tool | Native baseline | Matched knobs |
+|--------|----------|-----------------|---------------|
+| **lzma2** | `create --method lzma2` non-solid `.7z` | `7zz a -m0=LZMA2 -ms=off -mmt=N -mx=L` | threads, level, non-solid 7z |
+| **zstd** | `create --method zstd` non-solid `.7z` | Per-file `zstd -T1 -#` (≤N workers) + `7zz a -m0=Copy -ms=off` | workers, mapped zstd level, non-solid multi-member |
+| **lz4** | `create --method lz4` non-solid `.7z` | Per-file `lz4 -#` (≤N workers) + `7zz a -m0=Copy -ms=off` | workers, level, non-solid multi-member |
+
+Stock **7zz does not encode ZSTD/LZ4 methods** inside `.7z`. The zstd/lz4 native path is therefore a **layout-equivalent proxy** (independent compressed streams + non-solid store outer), not bit-identical 7z method IDs.
 
 Default create method remains **`lzma2`**.
 
 ### Level mapping (zstd)
 
-Our `--level 0..9` → CLI zstd levels: 1,1,2,3,5,7,9,12,15,19 (same as `codec::zstd_level`).
+Our `--level 0..9` → CLI zstd: 1,1,2,3,5,7,9,12,15,19.
 
 ## Requirements
 
 ```bash
 cargo build --release --bin rsync-archive --bin bench_compress
-# PATH: 7zz (or 7z), zstd, lz4, tar
+# PATH: 7zz (or 7z), zstd, lz4
 ```
 
 ## Run
 
 ```bash
-# Quick (~seconds–minutes)
-./target/release/bench_compress run --scale tiny --threads 1,4 --level 1 --methods all
-
-# Standard
-./target/release/bench_compress run --scale small --threads 1,4,8 --level 1,5 --methods all
-
-# Heavier
-./target/release/bench_compress run --scale medium --threads 1,4,12 --level 1,5 --methods lzma2,zstd
+./target/release/bench_compress run --scale tiny --threads 1,4 --level 1,5 --methods all
+./target/release/bench_compress run --scale small --threads 1,4 --level 1,5 --methods all
 ```
 
-Fixtures and outputs land in `benchdata/` (**gitignored**). Publish tables under `docs/bench/` when sharing results.
+Fixtures/outputs: `benchdata/` (gitignored). Published tables: [`docs/bench/RESULTS.md`](bench/RESULTS.md).
 
 ## Scales
 
@@ -45,5 +43,3 @@ Fixtures and outputs land in `benchdata/` (**gitignored**). Publish tables under
 | tiny | 200 | 8 KiB | ~1.6 MiB |
 | small | 2 000 | 10 KiB | ~20 MiB |
 | medium | 10 000 | 10 KiB | ~100 MiB |
-
-Content is highly compressible repeated text (stresses entropy coding, not incompressible noise).

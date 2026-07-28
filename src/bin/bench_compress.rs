@@ -306,7 +306,7 @@ fn run_bench(
     );
     println!();
     println!(
-        "{:<8} {:<6} {:>7} {:>10} {:>10} {:>10} {:>8} {:>8}  {}",
+        "{:<8} {:<16} {:>7} {:>10} {:>10} {:>10} {:>8} {:>8}  {}",
         "method", "tool", "threads", "level", "sec", "out_MiB", "ratio", "MiB/s", "notes"
     );
 
@@ -350,7 +350,7 @@ fn run_bench(
                     }
                     print_row(method.as_str(), "rsync-archive", t, level, input_bytes, &timed);
 
-                    // --- native ---
+                    // --- native (non-solid only) ---
                     let native = match method {
                         Method::Lzma2 => native_lzma2(
                             &out_root,
@@ -360,17 +360,21 @@ fn run_bench(
                             level,
                             rep,
                         ),
-                        Method::Zstd => native_zstd(
+                        Method::Zstd => native_codec_store(
+                            CodecKind::Zstd,
                             &out_root,
                             &tree,
+                            sevenz.as_deref(),
                             zstd.as_deref(),
                             t,
                             level,
                             rep,
                         ),
-                        Method::Lz4 => native_lz4(
+                        Method::Lz4 => native_codec_store(
+                            CodecKind::Lz4,
                             &out_root,
                             &tree,
+                            sevenz.as_deref(),
                             lz4.as_deref(),
                             t,
                             level,
@@ -391,18 +395,18 @@ fn run_bench(
     }
 
     println!();
-    println!("## Fairness notes");
+    println!("## Fairness notes (non-solid only)");
     println!(
-        "- **lzma2**: both produce **non-solid 7z** (ours vs `7zz a -m0=LZMA2 -ms=off -mmt=N -mx=L`)."
+        "- **All baselines are non-solid multi-member archives** (no solid tar streams)."
     );
     println!(
-        "- **zstd**: ours = non-solid 7z+Zstd packs; native = `tar | zstd -T N` → **solid stream** (different random-access model). Same mapped zstd level."
+        "- **lzma2**: ours vs `7zz a -m0=LZMA2 -ms=off -mmt=N -mx=L` (same 7z non-solid model)."
     );
     println!(
-        "- **lz4**: ours = non-solid 7z+LZ4 frames; native = `tar | lz4 -#` stream (if multi-thread N/A for classic lz4 CLI)."
+        "- **zstd/lz4**: stock 7zz cannot do -m0=zstd/lz4. Native proxy = **per-file CLI compress** (parallel up to N workers) then **`7zz a -m0=Copy -ms=off`** store outer. Same idea as our non-solid packs + independent compressed streams."
     );
     println!(
-        "- Threads: ours `--threads`/`--encode-concurrency` matched to native `-mmt` / `zstd -T` where applicable."
+        "- Threads: ours `--threads`/`--encode-concurrency` matched to 7zz `-mmt` (lzma2) or parallel per-file encode workers (zstd/lz4 proxy)."
     );
     println!(
         "- Wall time includes process spawn + full archive write; output size is final artifact bytes."
@@ -465,73 +469,151 @@ fn native_lzma2(
     }
 }
 
-fn native_zstd(
+#[derive(Clone, Copy)]
+enum CodecKind {
+    Zstd,
+    Lz4,
+}
+
+impl CodecKind {
+    fn name(self) -> &'static str {
+        match self {
+            CodecKind::Zstd => "zstd",
+            CodecKind::Lz4 => "lz4",
+        }
+    }
+
+    fn tool_label(self) -> &'static str {
+        match self {
+            CodecKind::Zstd => "zstd+7zz-Copy",
+            CodecKind::Lz4 => "lz4+7zz-Copy",
+        }
+    }
+
+    fn ext(self) -> &'static str {
+        match self {
+            CodecKind::Zstd => "zst",
+            CodecKind::Lz4 => "lz4",
+        }
+    }
+}
+
+/// Non-solid native proxy for zstd/lz4:
+/// 1) compress each file with CLI (up to `threads` parallel workers)
+/// 2) pack compressed blobs into non-solid 7z via `7zz -m0=Copy -ms=off`
+///
+/// Stock 7zz cannot encode ZSTD/LZ4 methods inside .7z; this is the fair layout peer.
+fn native_codec_store(
+    codec: CodecKind,
     out_root: &Path,
     tree: &Path,
-    zstd: Option<&Path>,
+    sevenz: Option<&Path>,
+    codec_bin: Option<&Path>,
     threads: u32,
     level: u32,
     rep: u32,
 ) -> NativeResult {
-    let Some(z) = zstd else {
+    let Some(cbin) = codec_bin else {
         return NativeResult {
-            tool: "zstd",
+            tool: codec.tool_label(),
             timed: Timed {
                 wall: Duration::ZERO,
                 out_bytes: 0,
                 ok: false,
-                note: "zstd not found".into(),
+                note: format!("{} CLI not found", codec.name()),
             },
         };
     };
-    let out = out_root.join(format!("native-zstd-t{threads}-l{level}-r{rep}.tar.zst"));
+    let Some(sz) = sevenz else {
+        return NativeResult {
+            tool: codec.tool_label(),
+            timed: Timed {
+                wall: Duration::ZERO,
+                out_bytes: 0,
+                ok: false,
+                note: "7zz not found (needed for Copy outer)".into(),
+            },
+        };
+    };
+
+    let out = out_root.join(format!(
+        "native-{}-t{}-l{}-r{}.7z",
+        codec.name(),
+        threads,
+        level,
+        rep
+    ));
+    let work = out_root.join(format!(
+        "native-{}-t{}-l{}-r{}-work",
+        codec.name(),
+        threads,
+        level,
+        rep
+    ));
     let _ = fs::remove_file(&out);
-    let zl = zstd_cli_level(level);
-    // tar -C tree -cf - . | zstd -T threads -level -o out
+    let _ = fs::remove_dir_all(&work);
+
     let start = Instant::now();
     let result = (|| -> Result<Timed, String> {
-        let mut tar = Command::new("tar")
-            .args(["-C", tree.to_str().ok_or("tree path")?, "-cf", "-", "."])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("tar spawn: {e}"))?;
-        let tar_out = tar.stdout.take().ok_or_else(|| "no tar stdout".to_string())?;
-        let zstd_out = Command::new(z)
-            .arg(format!("-T{threads}"))
-            .arg(format!("-{zl}"))
-            .arg("-f") // overwrite
-            .arg("-o")
-            .arg(&out)
-            .stdin(Stdio::from(tar_out))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| format!("zstd: {e}"))?;
-        let tar_status = tar.wait().map_err(|e| e.to_string())?;
-        if !tar_status.success() {
-            let err = tar.stderr.take(); // already waited
-            let _ = err;
-            return Ok(Timed {
-                wall: start.elapsed(),
-                out_bytes: 0,
-                ok: false,
-                note: format!("tar exit {:?}", tar_status.code()),
-            });
+        fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+        let files = collect_regular_files(tree).map_err(|e| e.to_string())?;
+        if files.is_empty() {
+            return Err("no files in fixture tree".into());
         }
-        if !zstd_out.status.success() {
+
+        // Parallel per-file encode with worker cap = threads
+        let workers = threads.max(1) as usize;
+        let zl = zstd_cli_level(level);
+        let lz_level = level.min(9).max(1);
+
+        std::thread::scope(|scope| -> Result<(), String> {
+            let mut next = 0usize;
+            let mut handles = Vec::new();
+            while next < files.len() || !handles.is_empty() {
+                while next < files.len() && handles.len() < workers {
+                    let src = files[next].clone();
+                    let rel = src
+                        .strip_prefix(tree)
+                        .map_err(|_| "strip_prefix".to_string())?
+                        .to_path_buf();
+                    // Mirror relative path + codec extension
+                    let dest = work.join(format!("{}.{}", rel.display(), codec.ext()));
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    let cbin = cbin.to_path_buf();
+                    next += 1;
+                    handles.push(scope.spawn(move || {
+                        compress_one_file(codec, &cbin, &src, &dest, zl, lz_level)
+                    }));
+                }
+                // Join oldest in-flight job (FIFO) to free a worker slot
+                let h = handles.remove(0);
+                h.join()
+                    .map_err(|_| "worker panicked".to_string())??;
+            }
+            Ok(())
+        })?;
+
+        // Store compressed blobs in non-solid 7z (Copy)
+        let st = Command::new(sz)
+            .arg("a")
+            .arg("-t7z")
+            .arg("-m0=Copy")
+            .arg("-ms=off")
+            .arg("-mmt=1")
+            .arg("-bso0")
+            .arg("-bsp0")
+            .arg(out.as_os_str())
+            .arg(format!("{}/.", work.display()))
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !st.success() {
             return Ok(Timed {
                 wall: start.elapsed(),
                 out_bytes: 0,
                 ok: false,
-                note: format!(
-                    "zstd exit {:?}: {}",
-                    zstd_out.status.code(),
-                    String::from_utf8_lossy(&zstd_out.stderr)
-                        .chars()
-                        .take(80)
-                        .collect::<String>()
-                ),
+                note: format!("7zz Copy exit {:?}", st.code()),
             });
         }
         if !out.exists() {
@@ -539,18 +621,24 @@ fn native_zstd(
                 wall: start.elapsed(),
                 out_bytes: 0,
                 ok: false,
-                note: "zstd ok but output missing".into(),
+                note: "7zz Copy ok but output missing".into(),
             });
         }
+        let _ = fs::remove_dir_all(&work);
         Ok(Timed {
             wall: start.elapsed(),
             out_bytes: du_bytes(&out),
             ok: true,
-            note: "tar|zstd solid stream".into(),
+            note: "per-file CLI + 7zz Copy non-solid".into(),
         })
     })();
+
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&work);
+    }
+
     NativeResult {
-        tool: "tar|zstd",
+        tool: codec.tool_label(),
         timed: result.unwrap_or_else(|e| Timed {
             wall: start.elapsed(),
             out_bytes: 0,
@@ -560,92 +648,80 @@ fn native_zstd(
     }
 }
 
-fn native_lz4(
-    out_root: &Path,
-    tree: &Path,
-    lz4: Option<&Path>,
-    threads: u32,
-    level: u32,
-    rep: u32,
-) -> NativeResult {
-    let Some(l) = lz4 else {
-        return NativeResult {
-            tool: "lz4",
-            timed: Timed {
-                wall: Duration::ZERO,
-                out_bytes: 0,
-                ok: false,
-                note: "lz4 not found".into(),
-            },
-        };
-    };
-    let out = out_root.join(format!("native-lz4-t{threads}-l{level}-r{rep}.tar.lz4"));
-    let _ = fs::remove_file(&out);
-    // Classic lz4 CLI is single-threaded for stream; note thread param unused.
-    let lz_level = level.min(9).max(1);
-    let start = Instant::now();
-    let result = (|| -> Result<Timed, String> {
-        let mut tar = Command::new("tar")
-            .args(["-C", tree.to_str().ok_or("tree path")?, "-cf", "-", "."])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("tar spawn: {e}"))?;
-        let tar_out = tar.stdout.take().ok_or_else(|| "no tar stdout".to_string())?;
-        // lz4 -# -f - out.lz4  (stdin → file)
-        let lz_out = Command::new(l)
-            .arg(format!("-{lz_level}"))
-            .arg("-f")
-            .arg("-")
-            .arg(&out)
-            .stdin(Stdio::from(tar_out))
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| format!("lz4: {e}"))?;
-        let tar_st = tar.wait().map_err(|e| e.to_string())?;
-        if !tar_st.success() {
-            return Ok(Timed {
-                wall: start.elapsed(),
-                out_bytes: 0,
-                ok: false,
-                note: format!("tar exit {:?}", tar_st.code()),
-            });
+fn collect_regular_files(tree: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for e in fs::read_dir(dir)? {
+            let e = e?;
+            let p = e.path();
+            let name = e.file_name();
+            if name == ".bench_ready" {
+                continue;
+            }
+            if p.is_dir() {
+                walk(&p, out)?;
+            } else if p.is_file() {
+                out.push(p);
+            }
         }
-        if !lz_out.status.success() {
-            return Ok(Timed {
-                wall: start.elapsed(),
-                out_bytes: 0,
-                ok: false,
-                note: format!("lz4 exit {:?}", lz_out.status.code()),
-            });
-        }
-        let mut note = "tar|lz4 solid stream".to_string();
-        if threads > 1 {
-            note.push_str("; lz4 CLI typically ST (threads N/A)");
-        }
-        Ok(Timed {
-            wall: start.elapsed(),
-            out_bytes: du_bytes(&out),
-            ok: true,
-            note,
-        })
-    })();
-    NativeResult {
-        tool: "tar|lz4",
-        timed: result.unwrap_or_else(|e| Timed {
-            wall: start.elapsed(),
-            out_bytes: 0,
-            ok: false,
-            note: e,
-        }),
+        Ok(())
     }
+    walk(tree, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+fn compress_one_file(
+    codec: CodecKind,
+    bin: &Path,
+    src: &Path,
+    dest: &Path,
+    zstd_level: i32,
+    lz4_level: u32,
+) -> Result<(), String> {
+    match codec {
+        CodecKind::Zstd => {
+            // zstd -T1 -# -f -o dest src  (one file per process; parallelism is across files)
+            let st = Command::new(bin)
+                .args([
+                    "-T1",
+                    &format!("-{zstd_level}"),
+                    "-f",
+                    "-o",
+                ])
+                .arg(dest)
+                .arg(src)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|e| e.to_string())?;
+            if !st.success() {
+                return Err(format!("zstd failed on {}", src.display()));
+            }
+        }
+        CodecKind::Lz4 => {
+            // lz4 -# -f src dest
+            let st = Command::new(bin)
+                .arg(format!("-{lz4_level}"))
+                .arg("-f")
+                .arg(src)
+                .arg(dest)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|e| e.to_string())?;
+            if !st.success() {
+                return Err(format!("lz4 failed on {}", src.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn print_row(method: &str, tool: &str, threads: u32, level: u32, input: u64, t: &Timed) {
     if !t.ok {
         println!(
-            "{:<8} {:<12} {:>7} {:>10} {:>10} {:>10} {:>8} {:>8}  FAIL {}",
+            "{:<8} {:<16} {:>7} {:>10} {:>10} {:>10} {:>8} {:>8}  FAIL {}",
             method,
             tool,
             threads,
@@ -668,7 +744,7 @@ fn print_row(method: &str, tool: &str, threads: u32, level: u32, input: u64, t: 
     };
     let mibs = in_mib / sec;
     println!(
-        "{:<8} {:<12} {:>7} {:>10} {:>10.3} {:>10.3} {:>8.2} {:>8.1}  {}",
+        "{:<8} {:<16} {:>7} {:>10} {:>10.3} {:>10.3} {:>8.2} {:>8.1}  {}",
         method,
         tool,
         threads,
