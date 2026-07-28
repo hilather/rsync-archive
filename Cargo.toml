@@ -1,0 +1,29 @@
+[package]
+name = "rsync-archive"
+version = "0.1.0"
+edition = "2021"
+description = "Create non-solid 7z archives with rsync-style selection; embed finished archives under a master store 7z"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/hilather/rsync-archive"
+keywords = ["7z", "rsync", "archive", "compression"]
+categories = ["command-line-utilities", "compression"]
+
+[[bin]]
+name = "rsync-archive"
+path = "src/main.rs"
+
+[lib]
+name = "rsync_archive"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
