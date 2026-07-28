@@ -47,6 +47,16 @@ pub enum Error {
 
     #[error("invalid UTF-8 path: {0}")]
     InvalidUtf8Path(String),
+
+    #[error("file too large for current encoder path: {path} ({size} bytes; limit {limit})")]
+    FileTooLarge {
+        path: PathBuf,
+        size: u64,
+        limit: u64,
+    },
+
+    #[error("compression error: {0}")]
+    Compress(String),
 }
 
 /// Convenient result alias.

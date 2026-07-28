@@ -1,8 +1,8 @@
 //! rsync-archive library: selection, non-solid 7z create, and store embed.
 //!
-//! Stage 2: non-solid 7z headers + Copy store writer (embed foundation).
-//! Stage 3: embed pipeline.
-//! Stage 4–5: rsync filters + walk + create dry-run (create write is Stage 6).
+//! Stage 2–3: store writer + embed.
+//! Stage 4–5: filters + walk + dry-run.
+//! Stage 6: non-solid LZMA2 create write.
 
 pub mod archive;
 pub mod cli;
@@ -12,7 +12,8 @@ pub mod select;
 pub mod util;
 
 pub use archive::{
-    write_raw_header, write_start_header, HeaderFile, NonsolidStoreWriter, SIG_HEADER_SIZE,
+    write_raw_header, write_start_header, HeaderFile, NonsolidLzma2Writer, NonsolidStoreWriter,
+    SIG_HEADER_SIZE,
 };
 pub use error::{Error, Result};
 pub use pipeline::{

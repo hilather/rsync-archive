@@ -4,7 +4,7 @@
 
 | | |
 |--|--|
-| **Status** | Stages 2–5 done; **`embed` + `create --dry-run` work**; create **write** is Stage 6 |
+| **Status** | Stages 2–6 done; **`create` and `embed` work** (non-solid 7z) |
 | **Selection** | [`docs/SELECTION.md`](docs/SELECTION.md) (rsync include/exclude v1) |
 | **License** | MIT |
 | **Design** | [`docs/DESIGN.md`](docs/DESIGN.md) |
@@ -51,28 +51,31 @@ cargo run -- --help
 cargo run -- create --help
 cargo run -- embed --help
 
-# create dry-run (selection only — write is Stage 6):
-cargo run -- create -o out.7z -n --exclude '*.tmp' ./src/
-cargo run -- create -o out.7z -n --files-from list.txt
+# create non-solid LZMA2 7z (stream compress):
+cargo run -- create -o out.7z --exclude '*.tmp' --level 5 --verify ./src/
+cargo run -- create -o out.7z -n --exclude '*.tmp' ./src/   # dry-run
+cargo run -- create -o out.7z --files-from list.txt
 
 # embed finished files under a master store 7z:
 cargo run -- embed -o master.7z --allow-any a.bin b.bin
 cargo run -- embed -o master.7z --force --verify nest1.7z nest2.7z
 ```
 
-### `create` selection / dry-run (Stage 5)
+### `create` (Stages 5–6)
 
 ```bash
-rsync-archive create -o game.7z -n \
+rsync-archive create -o game.7z \
   --exclude '*.tmp' \
   --exclude-from excludes.txt \
   --filter '- cache/**' \
+  --level 5 --verify \
   /data/game/
 
 rsync-archive create -o out.7z --files-from list.txt --dry-run
-# write still not implemented:
-# rsync-archive create -o out.7z --force --level 5 /data/tree
+rsync-archive create -o out.7z --force --level 1 /data/tree
 ```
+
+**Write model:** non-solid 7z, **LZMA2** (`0x21`) per non-empty file; empty files via empty flags; mtime from source; `OUT.partial` → rename; stream read + stream encode (peak RAM ≈ encoder dict for `--level`, not full file size).
 
 **Trailing `/` on SRC** strips the directory name from archive paths (`photos/` → `a.jpg`; `photos` → `photos/a.jpg`).  
 **`--files-from`:** exclusive of `SRC...`; relative lines keep path as member name; absolute lines use basename.  
@@ -144,8 +147,8 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for stages and PR plan.
 | 3 Embed pipeline | **Done** — `rsync-archive embed` (store/Copy, atomic partial, dry-run, verify) |
 | 4 Rsync filter engine | **Done** — see [`docs/SELECTION.md`](docs/SELECTION.md) |
 | 5 Walk + create dry-run | **Done** — `create -n` / selection / files-from / prune |
-| 6 Create LZMA2 write | Planned |
-| 6b Streaming LZMA2 (v1 blocker) | Planned |
+| 6 Create LZMA2 write | **Done** — non-solid LZMA2 create + verify |
+| 6b Streaming large-file hardening | Partial — Stage 6 already streams via `Lzma2Writer`; large-file e2e/RSS still optional |
 | 7 Verify + acceptance | Planned |
 | 9+ Directory size budgets (newest-first) | **Backlog** — [`docs/BACKLOG.md`](docs/BACKLOG.md) |
 ---
@@ -158,10 +161,10 @@ src/
   archive/sevenz/    # non-solid header + NonsolidStoreWriter (Copy) for embed
   select/            # SourceSpec, pathnorm, rules, matcher, from_file, walk
   pipeline/output.rs # partial path, --force check, rename helpers
-  pipeline/create.rs # create selection + dry-run (write Stage 6)
+  pipeline/create.rs # create selection + LZMA2 write
   pipeline/embed.rs  # embed command (store outer)
+  archive/sevenz/    # header, store_writer, lzma2_writer, codec
   util/              # tracing init
-  # later: archive/sevenz/lzma2_writer
 docs/
   DESIGN.md          # full design
   SELECTION.md       # filter semantics (Stage 4, frozen v1)

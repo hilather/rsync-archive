@@ -561,6 +561,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "crc32fast",
+ "lzma-rust2",
  "predicates",
  "sevenz-rust2",
  "tempfile",

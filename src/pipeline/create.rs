@@ -1,12 +1,15 @@
-//! Create pipeline: selection + dry-run (write lands in Stage 6).
+//! Create pipeline: selection, dry-run, and LZMA2 non-solid write.
 
+use crate::archive::NonsolidLzma2Writer;
 use crate::cli::CreateArgs;
 use crate::error::{Error, Result};
+use crate::pipeline::output::{cleanup_partial, commit_output, prepare_output};
 use crate::select::from_file::{load_exclude_from, load_include_from};
 use crate::select::walk::{
     collect_from_files_from, collect_from_sources, SelectedEntry, SelectionStats,
 };
 use crate::select::{RuleSet, SourceSpec};
+use std::path::Path;
 use tracing::info;
 
 /// Build the ordered filter set from create CLI flags.
@@ -40,7 +43,7 @@ pub fn build_rules(args: &CreateArgs) -> Result<RuleSet> {
     Ok(rules)
 }
 
-/// Build the full selection (same path for dry-run and future write).
+/// Build the full selection (same path for dry-run and write).
 ///
 /// Performs collision pre-scan inside collectors (K29).
 pub fn build_selection(args: &CreateArgs) -> Result<(Vec<SelectedEntry>, SelectionStats)> {
@@ -59,7 +62,7 @@ pub fn build_selection(args: &CreateArgs) -> Result<(Vec<SelectedEntry>, Selecti
 /// Run `rsync-archive create`.
 ///
 /// Dry-run lists archive names and exit 0 even when empty.
-/// Non-dry-run write is Stage 6 (returns not implemented after selection succeeds).
+/// Write builds a non-solid LZMA2 7z via partial+rename.
 pub fn run_create(args: CreateArgs) -> Result<()> {
     let (entries, stats) = build_selection(&args)?;
 
@@ -78,20 +81,75 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Selection succeeded (including collision checks). Write is Stage 6.
     if entries.is_empty() {
         return Err(Error::EmptyArchive);
     }
 
-    // Touch force/exists early so users get correct errors before Stage 6 lands.
-    if args.output.exists() && !args.force {
-        return Err(Error::OutputExists(args.output.clone()));
+    let paths = prepare_output(&args.output, args.force)?;
+    match write_create_archive(&paths.partial_path, &entries, args.level) {
+        Ok(()) => {
+            commit_output(&paths)?;
+            print_selection_summary(&stats, false);
+            info!(
+                path = %paths.final_path.display(),
+                count = entries.len(),
+                level = args.level,
+                "create complete"
+            );
+            eprintln!(
+                "created {} member(s) → {}",
+                entries.len(),
+                paths.final_path.display()
+            );
+            if args.verify {
+                verify_create_archive(&paths.final_path, entries.len())?;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            cleanup_partial(&paths);
+            Err(e)
+        }
     }
+}
 
-    let _ = entries;
-    Err(Error::NotImplemented(
-        "create write (Stage 6 / 6b — dry-run works in Stage 5)",
-    ))
+fn write_create_archive(
+    partial: &Path,
+    entries: &[SelectedEntry],
+    level: u32,
+) -> Result<()> {
+    let mut w = NonsolidLzma2Writer::create(partial, level)?;
+    for e in entries {
+        w.push_path(e.archive_name.clone(), &e.abs_path)?;
+    }
+    w.finish()
+}
+
+fn verify_create_archive(path: &Path, expected_files: usize) -> Result<()> {
+    use sevenz_rust2::ArchiveReader;
+
+    let reader = ArchiveReader::open(path, sevenz_rust2::Password::empty()).map_err(|e| {
+        Error::Archive(format!("verify open {}: {e}", path.display()))
+    })?;
+    let archive = reader.archive();
+    if archive.is_solid {
+        return Err(Error::Archive(format!(
+            "verify: archive is solid (expected non-solid): {}",
+            path.display()
+        )));
+    }
+    let n = archive
+        .files
+        .iter()
+        .filter(|e| !e.is_directory())
+        .count();
+    if n != expected_files {
+        return Err(Error::Archive(format!(
+            "verify member count: expected {expected_files}, got {n}"
+        )));
+    }
+    eprintln!("verify ok: {n} file member(s), non-solid");
+    Ok(())
 }
 
 fn print_selection_summary(stats: &SelectionStats, dry_run: bool) {
@@ -138,6 +196,7 @@ pub(crate) fn test_create_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sevenz_rust2::{ArchiveReader, Password};
     use std::fs;
     use tempfile::tempdir;
 
@@ -170,7 +229,6 @@ mod tests {
         args.include.push("*.c".into());
         args.exclude.push("*".into());
         let rules = build_rules(&args).unwrap();
-        // includes pushed before excludes
         assert_eq!(
             rules.action_for("a.c", false),
             crate::select::RuleAction::Include
@@ -196,16 +254,68 @@ mod tests {
     }
 
     #[test]
-    fn write_path_not_implemented_after_selection() {
+    fn create_write_roundtrip() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("tree");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("a.txt"), b"hello create").unwrap();
+        fs::write(root.join("sub/b.txt"), b"nested create").unwrap();
+        fs::write(root.join("empty.dat"), b"").unwrap();
+
+        let out = dir.path().join("out.7z");
+        let mut args = test_create_args(out.clone(), vec![format!("{}/", root.display())]);
+        args.dry_run = false;
+        args.level = 1;
+        args.verify = true;
+        run_create(args).unwrap();
+
+        assert!(out.exists());
+        assert!(!dir.path().join("out.7z.partial").exists());
+
+        let mut reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+        assert!(!reader.archive().is_solid);
+        assert_eq!(reader.read_file("a.txt").unwrap(), b"hello create");
+        assert_eq!(reader.read_file("sub/b.txt").unwrap(), b"nested create");
+        assert_eq!(reader.read_file("empty.dat").unwrap(), b"");
+    }
+
+    #[test]
+    fn create_refuses_overwrite_without_force() {
         let dir = tempdir().unwrap();
         let f = dir.path().join("a.txt");
-        fs::write(&f, b"hi").unwrap();
-        let mut args = test_create_args(
-            dir.path().join("out.7z"),
-            vec![f.to_string_lossy().into()],
-        );
+        fs::write(&f, b"x").unwrap();
+        let out = dir.path().join("out.7z");
+        fs::write(&out, b"old").unwrap();
+        let mut args = test_create_args(out, vec![f.to_string_lossy().into()]);
         args.dry_run = false;
         let err = run_create(args).unwrap_err();
-        assert!(matches!(err, Error::NotImplemented(_)));
+        assert!(matches!(err, Error::OutputExists(_)));
+    }
+
+    #[test]
+    fn create_writes_only_partial_then_final_in_output_dir() {
+        // Ensure we do not stage a full source tree beside the output.
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("f.txt"), b"data").unwrap();
+        let out = dir.path().join("out.7z");
+        let mut args = test_create_args(out.clone(), vec![format!("{}/", src.display())]);
+        args.dry_run = false;
+        args.level = 1;
+        run_create(args).unwrap();
+
+        assert!(out.exists());
+        assert!(!dir.path().join("out.7z.partial").exists());
+        // Source still intact; no "mirror" copy of the tree for archiving.
+        assert!(src.join("f.txt").exists());
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        // Only src/ and out.7z expected (no staged copy tree).
+        assert!(entries.iter().any(|n| n == "out.7z"));
+        assert!(entries.iter().any(|n| n == "src"));
+        assert_eq!(entries.len(), 2, "unexpected siblings: {entries:?}");
     }
 }

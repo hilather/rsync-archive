@@ -119,7 +119,9 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | `src/select/from_file.rs` | include-from / exclude-from / filter files; size/line caps |
 | `src/select/walk.rs` | SRC walk + `--files-from` → `SelectedEntry`; prune; collisions |
 | `src/pipeline/output.rs` | `*.partial` naming, `--force` check, rename commit |
-| `src/pipeline/create.rs` | **`create` selection + dry-run**; write Stage 6 |
+| `src/pipeline/create.rs` | **`create` selection + LZMA2 write** (partial+rename, verify) |
+| `src/archive/sevenz/lzma2_writer.rs` | `NonsolidLzma2Writer` — non-solid create packs |
+| `src/archive/sevenz/codec.rs` | LZMA2 stream encode helpers |
 | `src/util/` | Tracing init (`-v` / `-vv`) |
 | `src/archive/mod.rs` | Archive module root; re-exports store writer API |
 | `src/archive/sevenz/header.rs` | `HeaderFile`, `write_raw_header`, `write_start_header`, empty bits, names, mtime, attrs |

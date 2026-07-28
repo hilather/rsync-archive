@@ -20,6 +20,7 @@ path = "src/lib.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 crc32fast = "1"
+lzma-rust2 = { version = "0.16", default-features = false, features = ["std", "encoder"] }
 sevenz-rust2 = { version = "0.21", features = ["util"] }
 thiserror = "2"
 tracing = "0.1"

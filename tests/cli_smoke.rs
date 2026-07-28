@@ -64,24 +64,28 @@ fn create_files_from_with_src_is_usage_error() {
 }
 
 #[test]
-fn create_write_still_not_implemented() {
+fn create_write_success() {
     use std::fs;
     use tempfile::tempdir;
 
     let dir = tempdir().unwrap();
     let f = dir.path().join("a.txt");
-    fs::write(&f, b"hi").unwrap();
+    fs::write(&f, b"hi create").unwrap();
+    let out = dir.path().join("out.7z");
     bin()
         .args([
             "create",
             "-o",
-            dir.path().join("out.7z").to_str().unwrap(),
+            out.to_str().unwrap(),
+            "--level",
+            "1",
+            "--verify",
             f.to_str().unwrap(),
         ])
         .assert()
-        .failure()
-        .code(1)
-        .stderr(predicate::str::contains("not implemented"));
+        .success();
+    assert!(out.exists());
+    assert!(out.metadata().unwrap().len() > 32);
 }
 
 #[test]
