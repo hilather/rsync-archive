@@ -444,6 +444,7 @@ mod tests {
             abs_path: abs,
             archive_name: rel.replace('\\', "/"),
             size: data.len() as u64,
+            mtime_unix: None,
         }
     }
 

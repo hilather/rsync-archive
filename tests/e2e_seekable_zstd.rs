@@ -37,7 +37,11 @@ fn create_seekable_zstd_list_extract_matches() {
             &src,
         ])
         .assert()
-        .success();
+        .success()
+        .stderr(
+            predicate::str::contains("verify ok")
+                .and(predicate::str::contains("seekable-zstd")),
+        );
 
     assert!(out.exists());
     assert!(!dir.path().join("out.zst.partial").exists());
@@ -48,6 +52,34 @@ fn create_seekable_zstd_list_extract_matches() {
     assert_eq!(names, vec!["a.txt", "d/b.txt"]);
     assert_eq!(extract_member_bytes(&out, "a.txt").unwrap(), b"aaa-zst");
     assert_eq!(extract_member_bytes(&out, "d/b.txt").unwrap(), b"bbb-zst");
+}
+
+/// Stage 7: create `--verify` on seekable-zstd (index + per-member length).
+#[test]
+fn create_seekable_zstd_verify_flag() {
+    let dir = tempdir().unwrap();
+    let f = dir.path().join("a.txt");
+    fs::write(&f, b"verify-zst").unwrap();
+    let out = dir.path().join("v.zst");
+    bin()
+        .args([
+            "create",
+            "-o",
+            out.to_str().unwrap(),
+            "--format",
+            "seekable-zstd",
+            "--level",
+            "1",
+            "--verify",
+            f.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("verify ok: 1 member(s), seekable-zstd"));
+    assert_eq!(
+        extract_member_bytes(&out, "a.txt").unwrap(),
+        b"verify-zst"
+    );
 }
 
 #[test]

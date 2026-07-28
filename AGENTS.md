@@ -97,7 +97,10 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | Encode threads | **auto** (omit `--threads`; many tiny files → 1) |
 | Encode concurrency | **0** → auto from threads |
 | Encode size budget | **500M** in-flight uncompressed (like archiveconverter nested budget) |
-| Dir size budgets | `--dir-max-size PATH=SIZE` (optional); newest-mtime-first; longest prefix wins |
+| Dir size budgets | `--dir-max-size PATH=SIZE` (optional); recursive; newest-mtime-first; longest prefix wins |
+| Dir file-count limits | `--dir-max-files PATH=N` / `--dir-max-files-from` (optional); **recursive** under PATH/; longest prefix; newest-mtime-first |
+| Global size/count caps | `--max-total-size` / `--max-files` (optional); newest-mtime-first; after dir limits |
+| Per-file size/age | `--max-size` / `--min-size` (`0`=off) / `--newer-than` (e.g. `7d`); before dir budgets |
 | Embed method | **Copy** `0x00` (store), no recompress |
 | Embed naming | **Basename flatten** unless `--keep-path` |
 | Overwrite | **Error** if `-o` exists unless `--force` |
@@ -123,11 +126,12 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | `src/select/matcher.rs` | Path match, `action_for`, `should_prune_dir` |
 | `src/select/from_file.rs` | include-from / exclude-from / filter files; size/line caps |
 | `src/select/walk.rs` | SRC walk + `--files-from` → `SelectedEntry`; prune; collisions |
-| `src/select/dir_budget.rs` | `--dir-max-size` newest-first directory byte budgets |
+| `src/select/dir_budget.rs` | `--dir-max-size` + `--dir-max-files` (both recursive); `RestrictionReport` |
+| `src/select/global_restrict.rs` | `--max-size`/`--min-size`/`--newer-than` + global `--max-total-size`/`--max-files` |
 | `src/pipeline/output.rs` | `*.partial` naming, `--force` check, rename commit |
-| `src/pipeline/create.rs` | **`create` selection + LZMA2 write** (partial+rename, verify) |
-| `src/archive/sevenz/lzma2_writer.rs` | `NonsolidLzma2Writer` — non-solid create packs |
-| `src/archive/sevenz/codec.rs` | LZMA2 stream encode helpers |
+| `src/pipeline/create.rs` | **`create` selection + multi-method 7z / seekable-zstd** (partial+rename, verify) |
+| `src/archive/sevenz/lzma2_writer.rs` | `NonsolidLzma2Writer` — non-solid create packs (all methods) |
+| `src/archive/sevenz/codec.rs` | LZMA2 / Zstd / LZ4 encode; optional `liblzma` + `lz4-hc` features |
 | `src/archive/seekable_zstd/` | Seekable-zstd create + member index list/extract |
 | `src/util/` | Tracing init (`-v` / `-vv`) |
 | `src/archive/mod.rs` | Archive module root; re-exports store + seekable-zstd API |

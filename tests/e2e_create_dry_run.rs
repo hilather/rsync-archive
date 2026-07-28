@@ -183,6 +183,196 @@ fn dry_run_dir_budget_excludes_older_files() {
         .stdout(predicate::str::contains("logs/new.bin"))
         .stdout(predicate::str::contains("root.txt"))
         .stdout(predicate::str::contains("old.bin").not())
+        .stderr(predicate::str::contains("dir-max-size"))
+        .stderr(predicate::str::contains("skip:"))
+        .stderr(predicate::str::contains("logs/old.bin"))
         .stderr(predicate::str::contains("dir-budget skipped"));
     assert!(!dir.path().join("out.7z").exists());
+}
+
+#[test]
+fn dry_run_dir_file_limit_recursive() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("tree");
+    fs::create_dir_all(root.join("logs/nested")).unwrap();
+    let old = root.join("logs/old.bin");
+    let new = root.join("logs/new.bin");
+    let deep = root.join("logs/nested/deep.bin");
+    let keep = root.join("root.txt");
+    fs::write(&old, b"old").unwrap();
+    fs::write(&new, b"new").unwrap();
+    fs::write(&deep, b"deep").unwrap();
+    fs::write(&keep, b"keep").unwrap();
+    filetime::set_file_mtime(&old, filetime::FileTime::from_unix_time(100, 0)).unwrap();
+    filetime::set_file_mtime(&new, filetime::FileTime::from_unix_time(300, 0)).unwrap();
+    filetime::set_file_mtime(&deep, filetime::FileTime::from_unix_time(50, 0)).unwrap();
+
+    let src = format!("{}/", root.display());
+    bin()
+        .args([
+            "create",
+            "-o",
+            dir.path().join("out.7z").to_str().unwrap(),
+            "-n",
+            "--dir-max-files",
+            "logs/=1",
+            &src,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("logs/new.bin"))
+        .stdout(predicate::str::contains("root.txt"))
+        // recursive: nested files count against the limit too
+        .stdout(predicate::str::contains("logs/nested/deep.bin").not())
+        .stdout(predicate::str::contains("old.bin").not())
+        .stderr(predicate::str::contains("dir-max-files"))
+        .stderr(predicate::str::contains("skip:"))
+        .stderr(predicate::str::contains("dir-file-limit skipped"));
+    assert!(!dir.path().join("out.7z").exists());
+}
+
+#[test]
+fn dry_run_dir_file_limit_from_file() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("tree");
+    fs::create_dir_all(root.join("logs")).unwrap();
+    let old = root.join("logs/old.bin");
+    let new = root.join("logs/new.bin");
+    fs::write(&old, b"old").unwrap();
+    fs::write(&new, b"new").unwrap();
+    filetime::set_file_mtime(&old, filetime::FileTime::from_unix_time(100, 0)).unwrap();
+    filetime::set_file_mtime(&new, filetime::FileTime::from_unix_time(300, 0)).unwrap();
+
+    let list = dir.path().join("limits.txt");
+    fs::write(&list, "logs/=1\n").unwrap();
+
+    let src = format!("{}/", root.display());
+    bin()
+        .args([
+            "create",
+            "-o",
+            dir.path().join("out.7z").to_str().unwrap(),
+            "-n",
+            "--dir-max-files-from",
+            list.to_str().unwrap(),
+            &src,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("logs/new.bin"))
+        .stdout(predicate::str::contains("old.bin").not());
+}
+
+#[test]
+fn dry_run_max_total_size_newest_first() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("tree");
+    fs::create_dir_all(&root).unwrap();
+    let old = root.join("old.bin");
+    let new = root.join("new.bin");
+    fs::write(&old, vec![0u8; 20]).unwrap();
+    fs::write(&new, vec![0u8; 20]).unwrap();
+    filetime::set_file_mtime(&old, filetime::FileTime::from_unix_time(100, 0)).unwrap();
+    filetime::set_file_mtime(&new, filetime::FileTime::from_unix_time(300, 0)).unwrap();
+
+    let src = format!("{}/", root.display());
+    bin()
+        .args([
+            "create",
+            "-o",
+            dir.path().join("out.7z").to_str().unwrap(),
+            "-n",
+            "--max-total-size",
+            "25",
+            &src,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("new.bin"))
+        .stdout(predicate::str::contains("old.bin").not())
+        .stderr(predicate::str::contains("max-total-size="))
+        .stderr(predicate::str::contains("max-total-size skipped"));
+    assert!(!dir.path().join("out.7z").exists());
+}
+
+#[test]
+fn dry_run_max_files_and_max_size() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("tree");
+    fs::create_dir_all(&root).unwrap();
+    let a = root.join("a.bin");
+    let b = root.join("b.bin");
+    let huge = root.join("huge.bin");
+    fs::write(&a, b"a").unwrap();
+    fs::write(&b, b"b").unwrap();
+    fs::write(&huge, vec![0u8; 100]).unwrap();
+    filetime::set_file_mtime(&a, filetime::FileTime::from_unix_time(100, 0)).unwrap();
+    filetime::set_file_mtime(&b, filetime::FileTime::from_unix_time(200, 0)).unwrap();
+    filetime::set_file_mtime(&huge, filetime::FileTime::from_unix_time(300, 0)).unwrap();
+
+    let src = format!("{}/", root.display());
+    bin()
+        .args([
+            "create",
+            "-o",
+            dir.path().join("out.7z").to_str().unwrap(),
+            "-n",
+            "--max-size",
+            "50",
+            "--max-files",
+            "1",
+            &src,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("b.bin"))
+        .stdout(predicate::str::contains("a.bin").not())
+        .stdout(predicate::str::contains("huge.bin").not())
+        .stderr(predicate::str::contains("max-size:"))
+        .stderr(predicate::str::contains("max-files="))
+        .stderr(predicate::str::contains("max-size skipped"))
+        .stderr(predicate::str::contains("max-files skipped"));
+}
+
+#[test]
+fn dry_run_min_size_and_newer_than() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("tree");
+    fs::create_dir_all(&root).unwrap();
+    let tiny = root.join("tiny.bin");
+    let old = root.join("old.bin");
+    let ok = root.join("ok.bin");
+    fs::write(&tiny, b"x").unwrap();
+    fs::write(&old, vec![0u8; 20]).unwrap();
+    fs::write(&ok, vec![0u8; 20]).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    filetime::set_file_mtime(&tiny, filetime::FileTime::from_unix_time(now - 10, 0)).unwrap();
+    filetime::set_file_mtime(&old, filetime::FileTime::from_unix_time(now - 10_000, 0)).unwrap();
+    filetime::set_file_mtime(&ok, filetime::FileTime::from_unix_time(now - 10, 0)).unwrap();
+
+    let src = format!("{}/", root.display());
+    bin()
+        .args([
+            "create",
+            "-o",
+            dir.path().join("out.7z").to_str().unwrap(),
+            "-n",
+            "--min-size",
+            "10",
+            "--newer-than",
+            "100s",
+            &src,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ok.bin"))
+        .stdout(predicate::str::contains("tiny.bin").not())
+        .stdout(predicate::str::contains("old.bin").not())
+        .stderr(predicate::str::contains("min-size:"))
+        .stderr(predicate::str::contains("newer-than:"))
+        .stderr(predicate::str::contains("min-size skipped"))
+        .stderr(predicate::str::contains("older-than skipped"));
 }

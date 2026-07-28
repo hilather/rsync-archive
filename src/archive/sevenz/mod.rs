@@ -7,9 +7,10 @@ mod method;
 mod store_writer;
 
 pub use codec::{
-    compress_bytes, compress_path, compress_reader, compress_reader_append_pack,
-    compress_reader_to_writer, dict_size_for_level, lzma2_dict_prop, CompressedPack,
-    Lzma2Compressed, PackCrcWriter,
+    compress_bytes, compress_path, compress_path_with_size, compress_reader,
+    compress_reader_append_pack, compress_reader_append_pack_sized, compress_reader_to_writer,
+    dict_size_for_level, dict_size_for_member, lz4_hc_available, lz4_level_byte, lzma2_backend_name,
+    lzma2_dict_prop, zstd_level, CompressedPack, Lzma2Compressed, PackCrcWriter,
 };
 pub use header::{
     filetime_from_unix_secs, filetime_now, write_raw_header, write_start_header, write_u64,

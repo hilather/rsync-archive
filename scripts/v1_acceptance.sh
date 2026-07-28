@@ -30,8 +30,18 @@ echo "== create write + verify =="
 test -f out.7z
 
 echo "== create zstd / lz4 =="
-"$BIN" create -o z.7z --method zstd --level 3 --force --verify tree/
-"$BIN" create -o l.7z --method lz4 --force --verify tree/
+"$BIN" create -o z.7z --method zstd --level 3 --force --verify tree/ 2>z.err
+grep -q 'verify ok' z.err
+grep -q 'non-solid' z.err
+"$BIN" create -o l.7z --method lz4 --force --verify tree/ 2>l.err
+grep -q 'verify ok' l.err
+grep -q 'non-solid' l.err
+
+echo "== create seekable-zstd + verify =="
+"$BIN" create -o pack.zst --format seekable-zstd --level 1 --force --verify tree/ 2>zst.err
+grep -q 'verify ok' zst.err
+grep -q 'seekable-zstd' zst.err
+test -f pack.zst
 
 echo "== embed =="
 "$BIN" embed -o master.7z --allow-any --force --verify out.7z

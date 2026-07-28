@@ -22,6 +22,8 @@ pub struct SelectedEntry {
     pub archive_name: String,
     /// Size in bytes at selection time.
     pub size: u64,
+    /// Unix mtime seconds at selection (None if unavailable). Avoids re-stat on encode.
+    pub mtime_unix: Option<u64>,
 }
 
 /// Counters for skipped items during selection.
@@ -33,6 +35,19 @@ pub struct SelectionStats {
     pub skipped_excluded: u64,
     /// Files dropped solely because a `--dir-max-size` budget was exhausted.
     pub skipped_dir_budget: u64,
+    /// Files dropped solely because a `--dir-max-files` limit was exhausted
+    /// (immediate children only).
+    pub skipped_dir_file_limit: u64,
+    /// Single-file size above `--max-size`.
+    pub skipped_max_size: u64,
+    /// Single-file size below `--min-size`.
+    pub skipped_min_size: u64,
+    /// File mtime older than `--newer-than` window.
+    pub skipped_older_than: u64,
+    /// Dropped by global `--max-total-size` (newest-first fill).
+    pub skipped_max_total_size: u64,
+    /// Dropped by global `--max-files` (newest-first).
+    pub skipped_max_files: u64,
 }
 
 /// Collect selected entries from SRC walk mode.
@@ -48,6 +63,9 @@ pub fn collect_from_sources(
     let mut out = Vec::new();
     let mut stats = SelectionStats::default();
     let mut names = HashSet::new();
+    // OPT-04: resolve CWD once for relative paths.
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::Selection(format!("cwd: {e}")))?;
 
     for src in sources {
         match src.kind {
@@ -56,13 +74,14 @@ pub fn collect_from_sources(
                     &src.path,
                     &archive_name_for(src, &src.path)?,
                     rules,
+                    &cwd,
                     &mut out,
                     &mut stats,
                     &mut names,
                 )?;
             }
             SourceKind::Dir => {
-                walk_dir_source(src, rules, &mut out, &mut stats, &mut names)?;
+                walk_dir_source(src, rules, &cwd, &mut out, &mut stats, &mut names)?;
             }
         }
     }
@@ -74,6 +93,7 @@ pub fn collect_from_sources(
 fn walk_dir_source(
     src: &SourceSpec,
     rules: &RuleSet,
+    cwd: &Path,
     out: &mut Vec<SelectedEntry>,
     stats: &mut SelectionStats,
     names: &mut HashSet<String>,
@@ -107,7 +127,7 @@ fn walk_dir_source(
         }
 
         let archive_name = archive_name_for(src, path)?;
-        consider_file(path, &archive_name, rules, out, stats, names)?;
+        consider_file(path, &archive_name, rules, cwd, out, stats, names)?;
     }
     Ok(())
 }
@@ -167,6 +187,7 @@ fn consider_file(
     path: &Path,
     archive_name: &str,
     rules: &RuleSet,
+    cwd: &Path,
     out: &mut Vec<SelectedEntry>,
     stats: &mut SelectionStats,
     names: &mut HashSet<String>,
@@ -197,15 +218,20 @@ fn consider_file(
     let abs_path = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()
-            .map_err(|e| Error::Selection(format!("cwd: {e}")))?
-            .join(path)
+        cwd.join(path)
     };
+
+    let mtime_unix = meta.modified().ok().and_then(|t| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
+    });
 
     out.push(SelectedEntry {
         abs_path,
         archive_name: archive_name.to_string(),
         size: meta.len(),
+        mtime_unix,
     });
     Ok(())
 }
@@ -267,10 +293,17 @@ pub fn collect_from_files_from(
             return Err(Error::Collision(archive_name));
         }
 
+        let mtime_unix = meta.modified().ok().and_then(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs())
+        });
+
         out.push(SelectedEntry {
             abs_path: fs_path,
             archive_name,
             size: meta.len(),
+            mtime_unix,
         });
     }
 

@@ -676,7 +676,7 @@ pub struct SourceSpec {
 | protect / risk / hide / show | Deferred |
 | `--cvs-exclude` | Deferred |
 | `-0` / `--from0` | Deferred (v1.1 candidate) |
-| `--max-size` / `--min-size` | Deferred (Stage 9) |
+| `--max-size` / `--min-size` | **Done** — create post-filter; see SELECTION.md |
 | Regex excludes | Deferred |
 | Charset / Windows long paths | Deferred |
 

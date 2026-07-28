@@ -31,6 +31,13 @@ fn create_help_shows_key_flags() {
         .stdout(predicate::str::contains("--threads"))
         .stdout(predicate::str::contains("--encode-size-budget"))
         .stdout(predicate::str::contains("--dir-max-size"))
+        .stdout(predicate::str::contains("--dir-max-files"))
+        .stdout(predicate::str::contains("--dir-max-files-from"))
+        .stdout(predicate::str::contains("--max-total-size"))
+        .stdout(predicate::str::contains("--max-files"))
+        .stdout(predicate::str::contains("--max-size"))
+        .stdout(predicate::str::contains("--min-size"))
+        .stdout(predicate::str::contains("--newer-than"))
         .stdout(predicate::str::contains("--method"))
         .stdout(predicate::str::contains("--format"))
         .stdout(predicate::str::contains("seekable-zstd"));
@@ -179,6 +186,13 @@ fn create_validate_unit_rejects_both_modes() {
         encode_concurrency: 0,
         encode_size_budget: "500M".into(),
         dir_max_size: vec![],
+        dir_max_files: vec![],
+        dir_max_files_from: None,
+        max_total_size: None,
+        max_files: None,
+        max_size: None,
+        min_size: None,
+        newer_than: None,
         verify: false,
         sources: vec!["src".into()],
     };
@@ -207,6 +221,13 @@ fn create_validate_unit_accepts_sources_only() {
         encode_concurrency: 0,
         encode_size_budget: "500M".into(),
         dir_max_size: vec![],
+        dir_max_files: vec![],
+        dir_max_files_from: None,
+        max_total_size: None,
+        max_files: None,
+        max_size: None,
+        min_size: None,
+        newer_than: None,
         verify: false,
         sources: vec!["src".into()],
     };

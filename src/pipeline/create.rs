@@ -9,14 +9,20 @@
 //! `docs/FORMAT_SEEKABLE_ZSTD.md`).
 
 use crate::archive::sevenz::{
-    compress_path, filetime_from_unix_secs, CompressedPack, CompressMethod,
+    compress_path_with_size, filetime_from_unix_secs, CompressedPack, CompressMethod,
 };
 use crate::archive::{write_seekable_zstd, NonsolidLzma2Writer};
 use crate::cli::{CreateArgs, OutputFormat};
 use crate::error::{Error, Result};
 use crate::pipeline::output::{cleanup_partial, commit_output, prepare_output};
-use crate::select::dir_budget::{apply_dir_budgets, parse_dir_budgets};
+use crate::select::dir_budget::{
+    apply_dir_budgets, apply_dir_file_limits, collect_dir_file_limits, parse_dir_budgets,
+    RestrictionReport,
+};
 use crate::select::from_file::{load_exclude_from, load_include_from};
+use crate::select::global_restrict::{
+    apply_max_files, apply_max_total_size, apply_per_file_limits, per_file_limits_from_cli,
+};
 use crate::select::walk::{
     collect_from_files_from, collect_from_sources, SelectedEntry, SelectionStats,
 };
@@ -25,9 +31,14 @@ use crate::util::{
     can_admit, file_stats_from_sizes, parse_byte_size, resolve_encode_concurrency,
     resolve_encode_workers,
 };
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use tracing::info;
+use std::time::Instant;
+use tracing::{info, warn};
 
 /// Build the ordered filter set from create CLI flags.
 ///
@@ -62,9 +73,18 @@ pub fn build_rules(args: &CreateArgs) -> Result<RuleSet> {
 
 /// Build the full selection (same path for dry-run and write).
 ///
-/// Performs collision pre-scan inside collectors (K29), then applies
-/// `--dir-max-size` budgets (newest-first) when configured.
-pub fn build_selection(args: &CreateArgs) -> Result<(Vec<SelectedEntry>, SelectionStats)> {
+/// Order of operations:
+/// 1. Rsync filters / walk (collision pre-scan K29)
+/// 2. Per-file `--max-size` / `--min-size` / `--newer-than`
+/// 3. `--dir-max-size` (recursive, newest-first) and `--dir-max-files`
+///    (immediate children only, newest-first)
+/// 4. Global `--max-total-size` / `--max-files` (newest-first)
+///
+/// Restriction outcomes (kept + skipped under each limit) are returned for a
+/// compact stderr report — not one log line per file.
+pub fn build_selection(
+    args: &CreateArgs,
+) -> Result<(Vec<SelectedEntry>, SelectionStats, RestrictionReport)> {
     let rules = build_rules(args)?;
     let (entries, mut stats) = if let Some(list) = &args.files_from {
         collect_from_files_from(list, &rules)?
@@ -75,9 +95,37 @@ pub fn build_selection(args: &CreateArgs) -> Result<(Vec<SelectedEntry>, Selecti
         }
         collect_from_sources(&specs, &rules)?
     };
+    let mut report = RestrictionReport::default();
+
+    // 2. Per-file size / age filters.
+    let per_file = per_file_limits_from_cli(
+        args.max_size.as_deref(),
+        args.min_size.as_deref(),
+        args.newer_than.as_deref(),
+    )?;
+    let entries = apply_per_file_limits(entries, &per_file, &mut stats, &mut report)?;
+
+    // 3. Directory budgets and file-count limits.
     let budgets = parse_dir_budgets(&args.dir_max_size)?;
-    let entries = apply_dir_budgets(entries, &budgets, &mut stats)?;
-    Ok((entries, stats))
+    let entries = apply_dir_budgets(entries, &budgets, &mut stats, &mut report)?;
+    let file_limits =
+        collect_dir_file_limits(&args.dir_max_files, args.dir_max_files_from.as_deref())?;
+    let entries = apply_dir_file_limits(entries, &file_limits, &mut stats, &mut report)?;
+
+    // 4. Global caps (newest-mtime-first).
+    let entries = if let Some(ref s) = args.max_total_size {
+        let limit = parse_byte_size(s)?;
+        apply_max_total_size(entries, limit, &mut stats, &mut report)?
+    } else {
+        entries
+    };
+    let entries = if let Some(n) = args.max_files {
+        apply_max_files(entries, n, &mut stats, &mut report)?
+    } else {
+        entries
+    };
+
+    Ok((entries, stats, report))
 }
 
 /// Run `rsync-archive create`.
@@ -86,18 +134,25 @@ pub fn build_selection(args: &CreateArgs) -> Result<(Vec<SelectedEntry>, Selecti
 /// Write builds a non-solid 7z or seekable-zstd stream via partial+rename.
 pub fn run_create(args: CreateArgs) -> Result<()> {
     let format = args.resolved_format();
-    let (entries, stats) = build_selection(&args)?;
+    let (entries, stats, restrictions) = build_selection(&args)?;
 
     if args.dry_run {
         for e in &entries {
             println!("{}", e.archive_name);
         }
+        restrictions.eprint_compact();
         print_selection_summary(&stats, true);
         info!(
             format = format.as_str(),
             selected = stats.selected,
             skipped_excluded = stats.skipped_excluded,
             skipped_dir_budget = stats.skipped_dir_budget,
+            skipped_dir_file_limit = stats.skipped_dir_file_limit,
+            skipped_max_size = stats.skipped_max_size,
+            skipped_min_size = stats.skipped_min_size,
+            skipped_older_than = stats.skipped_older_than,
+            skipped_max_total_size = stats.skipped_max_total_size,
+            skipped_max_files = stats.skipped_max_files,
             skipped_symlinks = stats.skipped_symlinks,
             skipped_special = stats.skipped_special,
             "create dry-run complete"
@@ -106,12 +161,17 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
     }
 
     if entries.is_empty() {
+        // Still emit restriction report so operators see why nothing was kept.
+        restrictions.eprint_compact();
+        print_selection_summary(&stats, false);
         return Err(Error::EmptyArchive);
     }
 
     match format {
-        OutputFormat::SevenZ => run_create_sevenz(&args, &entries, &stats),
-        OutputFormat::SeekableZstd => run_create_seekable_zstd(&args, &entries, &stats),
+        OutputFormat::SevenZ => run_create_sevenz(&args, &entries, &stats, &restrictions),
+        OutputFormat::SeekableZstd => {
+            run_create_seekable_zstd(&args, &entries, &stats, &restrictions)
+        }
     }
 }
 
@@ -119,12 +179,38 @@ fn run_create_sevenz(
     args: &CreateArgs,
     entries: &[SelectedEntry],
     stats: &SelectionStats,
+    restrictions: &RestrictionReport,
 ) -> Result<()> {
+    let t0 = Instant::now();
     let method = CompressMethod::parse(&args.method)?;
     let (n, total_bytes) = file_stats_from_sizes(entries.iter().map(|e| e.size));
     let workers = resolve_encode_workers(args.threads, n, total_bytes);
     let concurrency = resolve_encode_concurrency(args.encode_concurrency, workers);
     let size_budget = parse_byte_size(&args.encode_size_budget)?;
+
+    // OPT-06: warn when explicit multi-thread on many-tiny (pool helps but still may not win).
+    if args.threads.is_some() && concurrency > 1 && n >= 1000 {
+        let avg = if n > 0 { total_bytes / n as u64 } else { 0 };
+        if avg < 64 * 1024 {
+            warn!(
+                concurrency,
+                file_count = n,
+                avg_bytes = avg,
+                "many tiny files: multi-thread may not beat single-thread (worker pool still used)"
+            );
+        }
+    }
+
+    // OPT-11: spare cores for large-member zstd MT when file-level concurrency is 1.
+    let zstd_nb_workers = if method == CompressMethod::Zstd && concurrency <= 1 {
+        std::thread::available_parallelism()
+            .map(|p| p.get() as u32)
+            .unwrap_or(1)
+            .min(4)
+            .max(1)
+    } else {
+        1
+    };
 
     info!(
         format = "7z",
@@ -134,10 +220,12 @@ fn run_create_sevenz(
         size_budget,
         file_count = n,
         total_bytes,
+        zstd_nb_workers,
         "create encode schedule"
     );
 
     let paths = prepare_output(&args.output, args.force)?;
+    let t_enc = Instant::now();
     match write_create_archive(
         &paths.partial_path,
         entries,
@@ -145,10 +233,22 @@ fn run_create_sevenz(
         method,
         concurrency,
         size_budget,
+        zstd_nb_workers,
     ) {
         Ok(()) => {
+            let encode_ms = t_enc.elapsed().as_millis();
             commit_output(&paths)?;
+            restrictions.eprint_compact();
             print_selection_summary(stats, false);
+            if timings_enabled() {
+                eprintln!(
+                    "timings: total={}ms encode={}ms members={} concurrency={}",
+                    t0.elapsed().as_millis(),
+                    encode_ms,
+                    entries.len(),
+                    concurrency
+                );
+            }
             info!(
                 path = %paths.final_path.display(),
                 count = entries.len(),
@@ -176,10 +276,15 @@ fn run_create_sevenz(
     }
 }
 
+fn timings_enabled() -> bool {
+    std::env::var_os("RSYNC_ARCHIVE_TIMINGS").is_some()
+}
+
 fn run_create_seekable_zstd(
     args: &CreateArgs,
     entries: &[SelectedEntry],
     stats: &SelectionStats,
+    restrictions: &RestrictionReport,
 ) -> Result<()> {
     info!(
         format = "seekable-zstd",
@@ -192,6 +297,7 @@ fn run_create_seekable_zstd(
     match write_seekable_zstd(&paths.partial_path, entries, args.level) {
         Ok(()) => {
             commit_output(&paths)?;
+            restrictions.eprint_compact();
             print_selection_summary(stats, false);
             info!(
                 path = %paths.final_path.display(),
@@ -236,35 +342,23 @@ fn write_create_archive(
     method: CompressMethod,
     concurrency: usize,
     size_budget: u64,
+    zstd_nb_workers: u32,
 ) -> Result<()> {
     if concurrency <= 1 {
-        let mut w = NonsolidLzma2Writer::create_with_method(partial, level, method)?;
+        let mut w = NonsolidLzma2Writer::create_with_method_workers(
+            partial,
+            level,
+            method,
+            zstd_nb_workers,
+        )?;
         for e in entries {
-            w.push_path(e.archive_name.clone(), &e.abs_path)?;
+            w.push_entry(e)?;
         }
         return w.finish();
     }
 
-    let prepared = encode_parallel(entries, level, method, concurrency, size_budget)?;
-    let mut w = NonsolidLzma2Writer::create_with_method(partial, level, method)?;
-    for p in prepared {
-        if p.empty {
-            w.push_packed_with_mtime(
-                p.name,
-                CompressedPack {
-                    data: vec![],
-                    method_id: vec![0x00],
-                    method_props: vec![],
-                    crc32: 0,
-                    uncompressed_size: 0,
-                },
-                p.mtime,
-            )?;
-        } else if let Some(c) = p.compressed {
-            w.push_packed_with_mtime(p.name, c, p.mtime)?;
-        }
-    }
-    w.finish()
+    // OPT-01/02/05: fixed worker pool + completion-driven ordered streaming write.
+    write_create_parallel(partial, entries, level, method, concurrency, size_budget)
 }
 
 fn encode_one(
@@ -272,19 +366,10 @@ fn encode_one(
     level: u32,
     method: CompressMethod,
 ) -> Result<PreparedMember> {
-    let meta = std::fs::symlink_metadata(&entry.abs_path).map_err(|e| {
-        Error::Archive(format!("stat {} for create: {e}", entry.abs_path.display()))
-    })?;
-    if meta.file_type().is_symlink() || !meta.is_file() {
-        return Err(Error::NotRegularFile(entry.abs_path.clone()));
-    }
-    let mtime = meta.modified().ok().and_then(|t| {
-        t.duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .map(|d| filetime_from_unix_secs(d.as_secs()))
-    });
+    // OPT-03: use selection-time size/mtime; no re-stat.
+    let mtime = entry.mtime_unix.map(filetime_from_unix_secs);
 
-    if meta.len() == 0 {
+    if entry.size == 0 {
         return Ok(PreparedMember {
             name: entry.archive_name.clone(),
             mtime,
@@ -293,7 +378,9 @@ fn encode_one(
         });
     }
 
-    let compressed = compress_path(&entry.abs_path, method, level)?;
+    // File-level workers: no extra zstd nbWorkers (avoid oversubscription).
+    let compressed =
+        compress_path_with_size(&entry.abs_path, method, level, Some(entry.size), 0)?;
     Ok(PreparedMember {
         name: entry.archive_name.clone(),
         mtime,
@@ -302,120 +389,246 @@ fn encode_one(
     })
 }
 
-/// Size-aware concurrent encode; results in **selection order**.
-fn encode_parallel(
+struct Job {
+    idx: usize,
+    size: u64,
+    entry: SelectedEntry,
+}
+
+struct JobQueue {
+    q: Mutex<VecDeque<Option<Job>>>,
+    cvar: Condvar,
+}
+
+/// Persistent worker pool: encode with size-budget admission; write packs in
+/// selection order as soon as each next index is ready (OPT-01/02/05).
+fn write_create_parallel(
+    partial: &Path,
     entries: &[SelectedEntry],
     level: u32,
     method: CompressMethod,
     max_workers: usize,
     size_budget: u64,
-) -> Result<Vec<PreparedMember>> {
+) -> Result<()> {
     let n = entries.len();
     if n == 0 {
-        return Ok(vec![]);
+        return Err(Error::EmptyArchive);
     }
 
-    // Slot results; filled out-of-order by workers.
-    let mut slots: Vec<Option<Result<PreparedMember>>> = (0..n).map(|_| None).collect();
+    let mut writer = NonsolidLzma2Writer::create_with_method(partial, level, method)?;
+    let queue = Arc::new(JobQueue {
+        q: Mutex::new(VecDeque::new()),
+        cvar: Condvar::new(),
+    });
+    let (res_tx, res_rx) = mpsc::channel::<(usize, u64, Result<PreparedMember>)>();
+    let panic_flag = Arc::new(AtomicBool::new(false));
 
-    thread::scope(|scope| {
-        let mut i = 0usize;
-        let mut running_sum = 0u64;
-        // (job_size, index, JoinHandle)
-        let mut handles: Vec<(u64, usize, thread::ScopedJoinHandle<'_, Result<PreparedMember>>)> =
-            Vec::new();
-
-        while i < n || !handles.is_empty() {
-            // Admit new jobs.
-            while i < n
-                && can_admit(
-                    running_sum,
-                    handles.len(),
-                    entries[i].size,
-                    size_budget,
-                    max_workers,
-                )
-            {
-                let idx = i;
-                let size = entries[i].size;
-                let entry = entries[i].clone();
-                running_sum = running_sum.saturating_add(size);
-                i += 1;
-                let handle = scope.spawn(move || encode_one(&entry, level, method));
-                handles.push((size, idx, handle));
-            }
-
-            if handles.is_empty() {
-                // Cannot admit next job (shouldn't happen: first job always admits).
-                if i < n {
-                    return Err(Error::Message(format!(
-                        "encode scheduler stuck at index {i} (workers={max_workers} budget={size_budget})"
-                    )));
+    thread::scope(|scope| -> Result<()> {
+        for _ in 0..max_workers {
+            let queue = Arc::clone(&queue);
+            let res_tx = res_tx.clone();
+            let panic_flag = Arc::clone(&panic_flag);
+            scope.spawn(move || {
+                loop {
+                    let job = {
+                        let mut g = queue.q.lock().unwrap();
+                        loop {
+                            if let Some(item) = g.pop_front() {
+                                break item;
+                            }
+                            g = queue.cvar.wait(g).unwrap();
+                        }
+                    };
+                    let Some(job) = job else {
+                        break; // shutdown
+                    };
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        encode_one(&job.entry, level, method)
+                    }));
+                    let result = match result {
+                        Ok(r) => r,
+                        Err(_) => {
+                            panic_flag.store(true, Ordering::SeqCst);
+                            Err(Error::Message("encode worker panicked".into()))
+                        }
+                    };
+                    let _ = res_tx.send((job.idx, job.size, result));
                 }
-                break;
-            }
-
-            // Join the oldest in-flight job (FIFO) to free budget.
-            let (size, idx, handle) = handles.remove(0);
-            let result = handle.join().map_err(|_| {
-                Error::Message("encode worker panicked".into())
-            })?;
-            running_sum = running_sum.saturating_sub(size);
-            slots[idx] = Some(result);
+            });
         }
+        drop(res_tx); // workers hold the only remaining senders
 
-        Ok(())
-    })?;
+        let outcome = (|| -> Result<()> {
+            let mut next_admit = 0usize;
+            let mut next_write = 0usize;
+            let mut running_sum = 0u64;
+            let mut running_count = 0usize;
+            let mut pending: BTreeMap<usize, PreparedMember> = BTreeMap::new();
 
-    let mut out = Vec::with_capacity(n);
-    for (i, slot) in slots.into_iter().enumerate() {
-        match slot {
-            Some(Ok(p)) => out.push(p),
-            Some(Err(e)) => return Err(e),
-            None => {
-                return Err(Error::Message(format!(
-                    "internal: missing encode result for index {i}"
-                )));
+            while next_write < n {
+                if panic_flag.load(Ordering::SeqCst) {
+                    return Err(Error::Message("encode worker panicked".into()));
+                }
+
+                // Admit jobs under concurrency + size budget.
+                while next_admit < n
+                    && can_admit(
+                        running_sum,
+                        running_count,
+                        entries[next_admit].size,
+                        size_budget,
+                        max_workers,
+                    )
+                {
+                    let size = entries[next_admit].size;
+                    let job = Job {
+                        idx: next_admit,
+                        size,
+                        entry: entries[next_admit].clone(),
+                    };
+                    {
+                        let mut g = queue.q.lock().unwrap();
+                        g.push_back(Some(job));
+                    }
+                    queue.cvar.notify_one();
+                    running_sum = running_sum.saturating_add(size);
+                    running_count += 1;
+                    next_admit += 1;
+                }
+
+                if running_count == 0 {
+                    if next_admit < n {
+                        return Err(Error::Message(format!(
+                            "encode scheduler stuck at index {next_admit} (workers={max_workers} budget={size_budget})"
+                        )));
+                    }
+                    break;
+                }
+
+                // OPT-05: wait for *any* completion (not FIFO join).
+                let (idx, size, result) = res_rx.recv().map_err(|_| {
+                    Error::Message("encode workers exited unexpectedly".into())
+                })?;
+                running_sum = running_sum.saturating_sub(size);
+                running_count = running_count.saturating_sub(1);
+
+                let prepared = result?;
+                pending.insert(idx, prepared);
+
+                // OPT-02: stream write in order as soon as next index is ready.
+                while let Some(p) = pending.remove(&next_write) {
+                    if p.empty {
+                        writer.push_packed_with_mtime(
+                            p.name,
+                            CompressedPack {
+                                data: vec![],
+                                method_id: vec![0x00],
+                                method_props: vec![],
+                                crc32: 0,
+                                uncompressed_size: 0,
+                                pack_crc: 0,
+                            },
+                            p.mtime,
+                        )?;
+                    } else if let Some(c) = p.compressed {
+                        writer.push_packed_with_mtime(p.name, c, p.mtime)?;
+                    }
+                    next_write += 1;
+                }
             }
+            Ok(())
+        })();
+
+        shutdown_workers(&queue, max_workers);
+        drop(res_rx);
+        outcome?;
+        writer.finish()
+    })
+}
+
+fn shutdown_workers(queue: &JobQueue, n: usize) {
+    {
+        let mut g = queue.q.lock().unwrap();
+        for _ in 0..n {
+            g.push_back(None);
         }
     }
-    Ok(out)
+    queue.cvar.notify_all();
 }
+
+/// Max member size for optional verify sample extract (keeps verify cheap).
+const VERIFY_SPOT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 fn verify_create_archive(path: &Path, expected_files: usize) -> Result<()> {
     use sevenz_rust2::ArchiveReader;
 
-    let reader = ArchiveReader::open(path, sevenz_rust2::Password::empty()).map_err(|e| {
+    let mut reader = ArchiveReader::open(path, sevenz_rust2::Password::empty()).map_err(|e| {
         Error::Archive(format!("verify open {}: {e}", path.display()))
     })?;
-    let archive = reader.archive();
-    if archive.is_solid {
-        return Err(Error::Archive(format!(
-            "verify: archive is solid (expected non-solid): {}",
-            path.display()
-        )));
+
+    // Collect checks under an immutable borrow, then drop before sample extract.
+    let (n, spot): (usize, Option<(String, u64)>) = {
+        let archive = reader.archive();
+        if archive.is_solid {
+            return Err(Error::Archive(format!(
+                "verify: archive is solid (expected non-solid): {}",
+                path.display()
+            )));
+        }
+        let n = archive
+            .files
+            .iter()
+            .filter(|e| !e.is_directory())
+            .count();
+        if n != expected_files {
+            return Err(Error::Archive(format!(
+                "verify member count: expected {expected_files}, got {n}"
+            )));
+        }
+        // Optional content spot-check: first suitable member (validates CRC on extract).
+        let spot = archive
+            .files
+            .iter()
+            .filter(|e| !e.is_directory() && e.size() > 0 && e.size() <= VERIFY_SPOT_MAX_BYTES)
+            .map(|e| (e.name().to_string(), e.size()))
+            .next();
+        (n, spot)
+    };
+
+    let mut sample_note = "";
+    if let Some((name, expected_size)) = spot {
+        let data = reader.read_file(&name).map_err(|e| {
+            Error::Archive(format!(
+                "verify sample extract {name} in {}: {e}",
+                path.display()
+            ))
+        })?;
+        if data.len() as u64 != expected_size {
+            return Err(Error::Archive(format!(
+                "verify sample size: {name}: expected {expected_size}, got {}",
+                data.len()
+            )));
+        }
+        sample_note = " + sample extract";
     }
-    let n = archive
-        .files
-        .iter()
-        .filter(|e| !e.is_directory())
-        .count();
-    if n != expected_files {
-        return Err(Error::Archive(format!(
-            "verify member count: expected {expected_files}, got {n}"
-        )));
-    }
-    eprintln!("verify ok: {n} file member(s), non-solid");
+
+    eprintln!("verify ok: {n} file member(s), non-solid{sample_note}");
     Ok(())
 }
 
 fn print_selection_summary(stats: &SelectionStats, dry_run: bool) {
     let mode = if dry_run { "dry-run" } else { "create" };
     eprintln!(
-        "{mode}: {} selected, {} excluded, {} dir-budget skipped, {} symlinks skipped, {} special skipped",
+        "{mode}: {} selected, {} excluded, {} dir-budget skipped, {} dir-file-limit skipped, {} max-size skipped, {} min-size skipped, {} older-than skipped, {} max-total-size skipped, {} max-files skipped, {} symlinks skipped, {} special skipped",
         stats.selected,
         stats.skipped_excluded,
         stats.skipped_dir_budget,
+        stats.skipped_dir_file_limit,
+        stats.skipped_max_size,
+        stats.skipped_min_size,
+        stats.skipped_older_than,
+        stats.skipped_max_total_size,
+        stats.skipped_max_files,
         stats.skipped_symlinks,
         stats.skipped_special
     );
@@ -452,6 +665,13 @@ pub(crate) fn test_create_args(
         encode_concurrency: 1,
         encode_size_budget: "500M".into(),
         dir_max_size: vec![],
+        dir_max_files: vec![],
+        dir_max_files_from: None,
+        max_total_size: None,
+        max_files: None,
+        max_size: None,
+        min_size: None,
+        newer_than: None,
         verify: false,
         sources,
     }
@@ -481,7 +701,7 @@ mod tests {
         args.exclude.push("cache/".into());
         args.dry_run = true;
 
-        let (entries, stats) = build_selection(&args).unwrap();
+        let (entries, stats, _) = build_selection(&args).unwrap();
         let names: Vec<_> = entries.iter().map(|e| e.archive_name.as_str()).collect();
         assert_eq!(names, vec!["a.rs"]);
         assert!(stats.skipped_excluded >= 1);
@@ -637,7 +857,7 @@ mod tests {
         args.dir_max_size = vec!["logs/=35".into()];
         args.dry_run = true;
 
-        let (dry_entries, stats) = build_selection(&args).unwrap();
+        let (dry_entries, stats, _) = build_selection(&args).unwrap();
         let dry_names: std::collections::HashSet<_> = dry_entries
             .iter()
             .map(|e| e.archive_name.as_str())
@@ -694,7 +914,7 @@ mod tests {
             vec![format!("{}/", root.display())],
         );
         args.dir_max_size = vec!["logs/=1000".into(), "logs/nested/=15".into()];
-        let (entries, stats) = build_selection(&args).unwrap();
+        let (entries, stats, _) = build_selection(&args).unwrap();
         let names: std::collections::HashSet<_> =
             entries.iter().map(|e| e.archive_name.as_str()).collect();
         assert_eq!(
@@ -702,6 +922,97 @@ mod tests {
             ["logs/a.bin", "logs/nested/b.bin"].into_iter().collect()
         );
         assert_eq!(stats.skipped_dir_budget, 1);
+    }
+
+    #[test]
+    fn dir_file_limit_recursive_newest_first() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("tree");
+        fs::create_dir_all(root.join("logs/nested")).unwrap();
+        let old = root.join("logs/old.bin");
+        let mid = root.join("logs/mid.bin");
+        let new = root.join("logs/new.bin");
+        let deep = root.join("logs/nested/deep.bin");
+        let keep = root.join("root.txt");
+        fs::write(&old, b"old").unwrap();
+        fs::write(&mid, b"mid").unwrap();
+        fs::write(&new, b"new").unwrap();
+        fs::write(&deep, b"deep").unwrap();
+        fs::write(&keep, b"keep").unwrap();
+        set_mtime(&old, 100);
+        set_mtime(&mid, 200);
+        set_mtime(&new, 300);
+        set_mtime(&deep, 50);
+        set_mtime(&keep, 1);
+
+        let src = format!("{}/", root.display());
+        let mut args = test_create_args(dir.path().join("out.7z"), vec![src.clone()]);
+        args.dir_max_files = vec!["logs/=2".into()];
+        let (entries, stats, _) = build_selection(&args).unwrap();
+        let names: std::collections::HashSet<_> =
+            entries.iter().map(|e| e.archive_name.as_str()).collect();
+        // recursive: newest 2 under logs/** = new+mid; deep+old skipped
+        assert_eq!(
+            names,
+            ["logs/mid.bin", "logs/new.bin", "root.txt"]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(stats.skipped_dir_file_limit, 2);
+        assert!(!names.contains("logs/old.bin"));
+        assert!(!names.contains("logs/nested/deep.bin"));
+
+        // Write path same selection.
+        let out = dir.path().join("files.7z");
+        let mut write_args = test_create_args(out.clone(), vec![src]);
+        write_args.dir_max_files = vec!["logs/=2".into()];
+        write_args.dry_run = false;
+        write_args.level = 1;
+        write_args.verify = true;
+        write_args.threads = Some(1);
+        run_create(write_args).unwrap();
+
+        let reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+        let members: std::collections::HashSet<String> = reader
+            .archive()
+            .files
+            .iter()
+            .filter(|e| !e.is_directory())
+            .map(|e| e.name().to_string())
+            .collect();
+        assert_eq!(members.len(), 3);
+        assert!(members.contains("logs/new.bin"));
+        assert!(members.contains("logs/mid.bin"));
+        assert!(!members.iter().any(|n| n.contains("old.bin") || n.contains("deep.bin")));
+    }
+
+    #[test]
+    fn dir_file_limit_from_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("tree");
+        fs::create_dir_all(root.join("cache")).unwrap();
+        let a = root.join("cache/a");
+        let b = root.join("cache/b");
+        let c = root.join("cache/c");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        fs::write(&c, b"c").unwrap();
+        set_mtime(&a, 100);
+        set_mtime(&b, 200);
+        set_mtime(&c, 300);
+
+        let list = dir.path().join("limits.txt");
+        fs::write(&list, "# comment\ncache/=1\n").unwrap();
+
+        let mut args = test_create_args(
+            dir.path().join("out.7z"),
+            vec![format!("{}/", root.display())],
+        );
+        args.dir_max_files_from = Some(list);
+        let (entries, stats, _) = build_selection(&args).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].archive_name, "cache/c");
+        assert_eq!(stats.skipped_dir_file_limit, 2);
     }
 
     #[test]
@@ -770,5 +1081,118 @@ mod tests {
         let mut reader = ArchiveReader::open(&out, Password::empty()).unwrap();
         assert!(!reader.archive().is_solid);
         assert_eq!(reader.read_file("a.txt").unwrap(), b"default-7z");
+    }
+
+    #[test]
+    fn global_max_total_size_newest_first_dry_run_and_write() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("tree");
+        fs::create_dir_all(&root).unwrap();
+        let old = root.join("old.bin");
+        let mid = root.join("mid.bin");
+        let new = root.join("new.bin");
+        fs::write(&old, vec![0u8; 10]).unwrap();
+        fs::write(&mid, vec![0u8; 20]).unwrap();
+        fs::write(&new, vec![0u8; 30]).unwrap();
+        set_mtime(&old, 100);
+        set_mtime(&mid, 200);
+        set_mtime(&new, 300);
+
+        let src = format!("{}/", root.display());
+        let mut args = test_create_args(dir.path().join("out.7z"), vec![src.clone()]);
+        args.max_total_size = Some("35".into());
+        args.dry_run = true;
+        let (entries, stats, report) = build_selection(&args).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].archive_name, "new.bin");
+        assert_eq!(stats.skipped_max_total_size, 2);
+        assert!(report.format_compact().contains("max-total-size="));
+
+        let out = dir.path().join("cap.7z");
+        let mut write_args = test_create_args(out.clone(), vec![src]);
+        write_args.max_total_size = Some("35".into());
+        write_args.dry_run = false;
+        write_args.level = 1;
+        write_args.verify = true;
+        write_args.threads = Some(1);
+        run_create(write_args).unwrap();
+        let mut reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+        let members: Vec<_> = reader
+            .archive()
+            .files
+            .iter()
+            .filter(|e| !e.is_directory())
+            .map(|e| e.name().to_string())
+            .collect();
+        assert_eq!(members, vec!["new.bin".to_string()]);
+        assert_eq!(reader.read_file("new.bin").unwrap().len(), 30);
+    }
+
+    #[test]
+    fn global_max_files_and_per_file_max_size() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("tree");
+        fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.bin");
+        let b = root.join("b.bin");
+        let c = root.join("c.bin");
+        let huge = root.join("huge.bin");
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        fs::write(&c, b"c").unwrap();
+        fs::write(&huge, vec![0u8; 100]).unwrap();
+        set_mtime(&a, 100);
+        set_mtime(&b, 200);
+        set_mtime(&c, 300);
+        set_mtime(&huge, 400);
+
+        let mut args = test_create_args(
+            dir.path().join("out.7z"),
+            vec![format!("{}/", root.display())],
+        );
+        args.max_size = Some("50".into());
+        args.max_files = Some(2);
+        let (entries, stats, report) = build_selection(&args).unwrap();
+        // huge skipped by max-size; then max-files keeps newest 2 of a,b,c → b,c
+        let names: std::collections::HashSet<_> =
+            entries.iter().map(|e| e.archive_name.as_str()).collect();
+        assert_eq!(names, ["b.bin", "c.bin"].into_iter().collect());
+        assert_eq!(stats.skipped_max_size, 1);
+        assert_eq!(stats.skipped_max_files, 1);
+        let text = report.format_compact();
+        assert!(text.contains("max-size:"), "{text}");
+        assert!(text.contains("max-files="), "{text}");
+    }
+
+    #[test]
+    fn min_size_and_newer_than() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("tree");
+        fs::create_dir_all(&root).unwrap();
+        let tiny = root.join("tiny.bin");
+        let old = root.join("old.bin");
+        let ok = root.join("ok.bin");
+        fs::write(&tiny, b"x").unwrap();
+        fs::write(&old, vec![0u8; 20]).unwrap();
+        fs::write(&ok, vec![0u8; 20]).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        set_mtime(&tiny, now - 10);
+        set_mtime(&old, now - 10_000);
+        set_mtime(&ok, now - 10);
+
+        let mut args = test_create_args(
+            dir.path().join("out.7z"),
+            vec![format!("{}/", root.display())],
+        );
+        args.min_size = Some("10".into());
+        args.newer_than = Some("100s".into());
+        let (entries, stats, _) = build_selection(&args).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].archive_name, "ok.bin");
+        assert_eq!(stats.skipped_min_size, 1);
+        assert_eq!(stats.skipped_older_than, 1);
     }
 }

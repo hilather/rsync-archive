@@ -133,9 +133,45 @@ pub struct CreateArgs {
     /// Format: `PATH=SIZE` (e.g. `logs/=100M`, `cache=50M`). After normal filters,
     /// files under `PATH` are considered newest-mtime-first; further files that
     /// would exceed the budget are skipped (counted as dir-budget skips).
-    /// Nested budgets: longest matching prefix wins.
+    /// Nested budgets: longest matching prefix wins. Scope is **recursive**.
     #[arg(long = "dir-max-size", value_name = "PATH=SIZE", action = clap::ArgAction::Append)]
     pub dir_max_size: Vec<String>,
+
+    /// Cap number of selected files that are **direct children** of a directory
+    /// (repeatable). Nested files under subdirectories are not counted.
+    ///
+    /// Format: `PATH=N` (e.g. `logs/=10`, `cache=5`). After filters (and size
+    /// budgets), direct children of `PATH` are considered newest-mtime-first;
+    /// only the `N` newest are kept.
+    #[arg(long = "dir-max-files", value_name = "PATH=N", action = clap::ArgAction::Append)]
+    pub dir_max_files: Vec<String>,
+
+    /// Read `--dir-max-files` lines from a file (`PATH=N` per line; `#` comments OK).
+    #[arg(long = "dir-max-files-from", value_name = "FILE")]
+    pub dir_max_files_from: Option<PathBuf>,
+
+    /// Global cap on total selected uncompressed bytes (newest-mtime-first fill).
+    ///
+    /// Applied after filters, per-file size/age limits, and directory budgets.
+    /// Further files that would exceed the budget are skipped (compact report).
+    #[arg(long = "max-total-size", value_name = "SIZE")]
+    pub max_total_size: Option<String>,
+
+    /// Global max number of selected files (newest-mtime-first).
+    #[arg(long = "max-files", value_name = "N")]
+    pub max_files: Option<u64>,
+
+    /// Skip any single file larger than SIZE (e.g. `100M`).
+    #[arg(long = "max-size", value_name = "SIZE")]
+    pub max_size: Option<String>,
+
+    /// Skip files smaller than SIZE (`0` or omit = off).
+    #[arg(long = "min-size", value_name = "SIZE")]
+    pub min_size: Option<String>,
+
+    /// Only files with mtime within the last DURATION (e.g. `7d`, `24h`, `30m`, `90s`).
+    #[arg(long = "newer-than", value_name = "DURATION")]
+    pub newer_than: Option<String>,
 
     /// After write, list/test the archive.
     #[arg(long = "verify")]
@@ -285,6 +321,13 @@ mod tests {
             encode_concurrency: 0,
             encode_size_budget: "500M".into(),
             dir_max_size: vec![],
+            dir_max_files: vec![],
+            dir_max_files_from: None,
+            max_total_size: None,
+            max_files: None,
+            max_size: None,
+            min_size: None,
+            newer_than: None,
             verify: false,
             sources: vec![".".into()],
         };

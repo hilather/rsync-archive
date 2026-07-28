@@ -21,10 +21,26 @@ path = "src/bin/bench_compress.rs"
 name = "rsync_archive"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Optional C-backed LZMA2 encoder (raw LZMA2 via liblzma). Default remains pure-Rust
+# `lzma-rust2`. Requires a C toolchain; uses system liblzma when available, else
+# builds bundled xz sources. Enable `liblzma-static` to force static/bundled link.
+liblzma = ["dep:liblzma"]
+liblzma-static = ["liblzma", "liblzma/static"]
+# Optional true LZ4HC for create `--method lz4` at levels >= 3 (liblz4 via `lz4`
+# crate; sources vendored by lz4-sys — no system liblz4 required). Levels 1–2 stay
+# on pure-Rust `lz4_flex` for max throughput.
+lz4-hc = ["dep:lz4"]
+# Convenience: both optional native codec backends.
+native-codecs = ["liblzma", "lz4-hc"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 crc32fast = "1"
+lz4 = { version = "1.28", optional = true }
 lz4_flex = "0.11"
+liblzma = { version = "0.4", optional = true }
 lzma-rust2 = { version = "0.16", default-features = false, features = ["std", "encoder"] }
 sevenz-rust2 = { version = "0.21", features = ["util", "zstd", "lz4"] }
 thiserror = "2"
@@ -32,7 +48,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
 zeekstd = "0.6.2"
-zstd = "0.13"
+zstd = { version = "0.13", features = ["zstdmt"] }
 
 [dev-dependencies]
 assert_cmd = "2"

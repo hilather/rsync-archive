@@ -96,8 +96,14 @@ fn create_method_zstd() {
             f.to_str().unwrap(),
         ])
         .assert()
-        .success();
+        .success()
+        .stderr(
+            predicate::str::contains("verify ok")
+                .and(predicate::str::contains("non-solid"))
+                .and(predicate::str::contains("sample extract")),
+        );
     let mut reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+    assert!(!reader.archive().is_solid);
     assert_eq!(reader.read_file("a.txt").unwrap(), b"zstd-e2e");
 }
 
@@ -118,9 +124,45 @@ fn create_method_lz4() {
             f.to_str().unwrap(),
         ])
         .assert()
-        .success();
+        .success()
+        .stderr(
+            predicate::str::contains("verify ok")
+                .and(predicate::str::contains("non-solid"))
+                .and(predicate::str::contains("sample extract")),
+        );
     let mut reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+    assert!(!reader.archive().is_solid);
     assert_eq!(reader.read_file("a.txt").unwrap(), b"lz4-e2e");
+}
+
+/// Stage 7: `--verify` reports non-solid + member count for default lzma2.
+#[test]
+fn create_verify_lzma2_reports_non_solid() {
+    let dir = tempdir().unwrap();
+    let f = dir.path().join("a.txt");
+    fs::write(&f, b"verify-lzma2").unwrap();
+    let out = dir.path().join("v.7z");
+    bin()
+        .args([
+            "create",
+            "-o",
+            out.to_str().unwrap(),
+            "--method",
+            "lzma2",
+            "--level",
+            "1",
+            "--verify",
+            f.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("verify ok: 1 file member(s), non-solid")
+                .and(predicate::str::contains("sample extract")),
+        );
+    let mut reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+    assert!(!reader.archive().is_solid);
+    assert_eq!(reader.read_file("a.txt").unwrap(), b"verify-lzma2");
 }
 
 #[test]

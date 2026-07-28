@@ -5,14 +5,18 @@
 //! - Explicit `--threads` always wins.
 //! - Nested (here: concurrent file encodes) workers auto from threads/CPUs when `0`.
 
-/// Defaults tuned like archiveconverter: many tiny files → prefer 1 pack worker.
-pub const HIGH_FILE_COUNT: usize = 1_000;
+/// Defaults: many tiny files → prefer 1 pack worker (still best after pool fix for
+/// sub-64KiB averages; pool removes spawn tax when user forces `--threads`).
+pub const HIGH_FILE_COUNT: usize = 2_000;
 pub const SMALL_AVG_SIZE: u64 = 64 * 1024; // 64 KiB
+/// OPT-14: if avg size is at least this, allow auto multi-thread even with more files.
+pub const MEDIUM_AVG_SIZE: u64 = 256 * 1024; // 256 KiB
 
 /// Resolve pack / encode worker count for create.
 ///
 /// - If `explicit` is set, always honor it (at least 1).
 /// - Else if selection looks like "many tiny files", return `1`.
+/// - Else if few files but large average, use available parallelism.
 /// - Else return available parallelism (at least 1).
 pub fn resolve_encode_workers(
     explicit: Option<u32>,
@@ -26,24 +30,32 @@ pub fn resolve_encode_workers(
         return 1;
     }
     let avg = total_bytes / file_count as u64;
-    if file_count >= HIGH_FILE_COUNT || avg < SMALL_AVG_SIZE {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    // Many tiny → still 1 (codec setup dominates; sequential is fine).
+    if avg < SMALL_AVG_SIZE && file_count >= 64 {
         tracing::debug!(
             file_count,
             avg_bytes = avg,
-            "auto encode workers → 1 (many/tiny files; archiveconverter policy)"
+            "auto encode workers → 1 (tiny avg size)"
+        );
+        1
+    } else if file_count >= HIGH_FILE_COUNT && avg < MEDIUM_AVG_SIZE {
+        tracing::debug!(
+            file_count,
+            avg_bytes = avg,
+            "auto encode workers → 1 (high file count, smallish avg)"
         );
         1
     } else {
-        let n = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
         tracing::debug!(
             file_count,
             avg_bytes = avg,
-            workers = n,
+            workers = cpus,
             "auto encode workers → available_parallelism"
         );
-        n
+        cpus
     }
 }
 

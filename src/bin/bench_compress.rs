@@ -1,6 +1,9 @@
 //! Fair compression benchmarks: rsync-archive vs native tools.
 //!
-//! Compares under matched threads / level / non-solid (where applicable).
+//! Compares under matched threads / level / non-solid multi-member archives.
+//! - lzma2 → stock `7zz` (`-m0=LZMA2 -ms=off`)
+//! - zstd/lz4 → preferred `7zz-zstd` (7-Zip-zstd: `-m0=zstd|lz4 -ms=off`);
+//!   fallback: per-file CLI + `7zz -m0=Copy` if ZS binary missing
 //!
 //! ```text
 //! cargo build --release --bin bench_compress --bin rsync-archive
@@ -289,6 +292,7 @@ fn run_bench(
     let methods = Method::parse_list(methods_s);
     let our = our_bin();
     let sevenz = which("7zz").or_else(|| which("7z"));
+    let sevenz_zs = find_sevenz_zs();
     let zstd = which("zstd");
     let lz4 = which("lz4");
 
@@ -299,14 +303,31 @@ fn run_bench(
     );
     println!("# our={}", our.display());
     println!(
-        "# native: 7zz={} zstd={} lz4={}",
-        sevenz.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "MISSING".into()),
-        zstd.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "MISSING".into()),
-        lz4.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "MISSING".into()),
+        "# native: 7zz={} 7zz-zstd={} zstd={} lz4={}",
+        sevenz
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "MISSING".into()),
+        sevenz_zs
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "MISSING (proxy fallback)".into()),
+        zstd.as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "MISSING".into()),
+        lz4.as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "MISSING".into()),
     );
+    if sevenz_zs.is_none() {
+        eprintln!(
+            "# note: install 7-Zip-zstd as 7zz-zstd for fair zstd/lz4 native baseline \
+             (https://github.com/mcmilk/7-Zip-zstd/releases — linux-gcc-x64.zip)"
+        );
+    }
     println!();
     println!(
-        "{:<8} {:<16} {:>7} {:>10} {:>10} {:>10} {:>8} {:>8}  {}",
+        "{:<8} {:<18} {:>7} {:>10} {:>10} {:>10} {:>8} {:>8}  {}",
         "method", "tool", "threads", "level", "sec", "out_MiB", "ratio", "MiB/s", "notes"
     );
 
@@ -360,20 +381,22 @@ fn run_bench(
                             level,
                             rep,
                         ),
-                        Method::Zstd => native_codec_store(
+                        Method::Zstd => native_zstd_or_lz4(
                             CodecKind::Zstd,
                             &out_root,
                             &tree,
+                            sevenz_zs.as_deref(),
                             sevenz.as_deref(),
                             zstd.as_deref(),
                             t,
                             level,
                             rep,
                         ),
-                        Method::Lz4 => native_codec_store(
+                        Method::Lz4 => native_zstd_or_lz4(
                             CodecKind::Lz4,
                             &out_root,
                             &tree,
+                            sevenz_zs.as_deref(),
                             sevenz.as_deref(),
                             lz4.as_deref(),
                             t,
@@ -383,7 +406,7 @@ fn run_bench(
                     };
                     print_row(
                         method.as_str(),
-                        native.tool,
+                        &native.tool,
                         t,
                         level,
                         input_bytes,
@@ -403,10 +426,15 @@ fn run_bench(
         "- **lzma2**: ours vs `7zz a -m0=LZMA2 -ms=off -mmt=N -mx=L` (same 7z non-solid model)."
     );
     println!(
-        "- **zstd/lz4**: stock 7zz cannot do -m0=zstd/lz4. Native proxy = **per-file CLI compress** (parallel up to N workers) then **`7zz a -m0=Copy -ms=off`** store outer. Same idea as our non-solid packs + independent compressed streams."
+        "- **zstd/lz4 preferred**: 7-Zip-zstd (`7zz-zstd`) one-shot \
+         `-m0=zstd|lz4 -ms=off -mmt=N -mx=L` (same non-solid 7z + method IDs as we write)."
     );
     println!(
-        "- Threads: ours `--threads`/`--encode-concurrency` matched to 7zz `-mmt` (lzma2) or parallel per-file encode workers (zstd/lz4 proxy)."
+        "- **zstd/lz4 fallback** (no ZS binary): per-file CLI compress (≤N workers) + \
+         `7zz a -m0=Copy -ms=off` store outer (layout proxy only)."
+    );
+    println!(
+        "- Threads: ours `--threads`/`--encode-concurrency` matched to 7zz `-mmt`."
     );
     println!(
         "- Wall time includes process spawn + full archive write; output size is final artifact bytes."
@@ -415,8 +443,44 @@ fn run_bench(
 }
 
 struct NativeResult {
-    tool: &'static str,
+    tool: String,
     timed: Timed,
+}
+
+/// Locate a 7-Zip build that can **encode** ZSTD/LZ4 methods into `.7z`
+/// (7-Zip-zstd / 7-Zip ZS). Prefers an explicit `7zz-zstd` name so stock
+/// mainline `7zz` is left alone for LZMA2.
+fn find_sevenz_zs() -> Option<PathBuf> {
+    let candidates = [
+        "7zz-zstd",
+        "7z-zstd",
+        "7zz",
+        "7z",
+        "7za",
+        "7zr",
+    ];
+    for name in candidates {
+        if let Some(p) = which(name) {
+            if sevenz_has_encode_codec(&p, "4F71101") {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// True if `bin i` lists the codec id (encode-capable ZS builds show `ED 4F71101 ZSTD`).
+fn sevenz_has_encode_codec(bin: &Path, codec_id: &str) -> bool {
+    let out = Command::new(bin).arg("i").output().ok();
+    let Some(out) = out else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Require the hex method id (format line "zstd" alone is stock mainline read-only .zst).
+    text.contains(codec_id)
 }
 
 fn native_lzma2(
@@ -429,7 +493,7 @@ fn native_lzma2(
 ) -> NativeResult {
     let Some(sz) = sevenz else {
         return NativeResult {
-            tool: "7zz",
+            tool: "7zz".into(),
             timed: Timed {
                 wall: Duration::ZERO,
                 out_bytes: 0,
@@ -464,7 +528,7 @@ fn native_lzma2(
         }
     }
     NativeResult {
-        tool: "7zz-LZMA2",
+        tool: "7zz-LZMA2".into(),
         timed,
     }
 }
@@ -483,7 +547,21 @@ impl CodecKind {
         }
     }
 
-    fn tool_label(self) -> &'static str {
+    fn method_flag(self) -> &'static str {
+        match self {
+            CodecKind::Zstd => "zstd",
+            CodecKind::Lz4 => "lz4",
+        }
+    }
+
+    fn zs_tool_label(self) -> &'static str {
+        match self {
+            CodecKind::Zstd => "7zz-zstd",
+            CodecKind::Lz4 => "7zz-lz4",
+        }
+    }
+
+    fn proxy_tool_label(self) -> &'static str {
         match self {
             CodecKind::Zstd => "zstd+7zz-Copy",
             CodecKind::Lz4 => "lz4+7zz-Copy",
@@ -496,13 +574,97 @@ impl CodecKind {
             CodecKind::Lz4 => "lz4",
         }
     }
+
+    /// Map our 0–9 create level to 7-Zip-zstd `-mx` (same scale as the codec).
+    fn zs_mx(self, our_level: u32) -> u32 {
+        match self {
+            // Match create codec / CLI zstd mapping so ratios are comparable.
+            CodecKind::Zstd => zstd_cli_level(our_level) as u32,
+            // LZ4 HC levels are roughly 1–12; our 0–9 maps directly (0 → 1).
+            CodecKind::Lz4 => our_level.min(12).max(1),
+        }
+    }
 }
 
-/// Non-solid native proxy for zstd/lz4:
+/// Prefer 7-Zip-zstd native `-m0=zstd|lz4`; else fall back to per-file CLI + Copy.
+fn native_zstd_or_lz4(
+    codec: CodecKind,
+    out_root: &Path,
+    tree: &Path,
+    sevenz_zs: Option<&Path>,
+    sevenz_stock: Option<&Path>,
+    codec_bin: Option<&Path>,
+    threads: u32,
+    level: u32,
+    rep: u32,
+) -> NativeResult {
+    if let Some(sz) = sevenz_zs {
+        return native_zs_method(codec, out_root, tree, sz, threads, level, rep);
+    }
+    native_codec_store(
+        codec,
+        out_root,
+        tree,
+        sevenz_stock,
+        codec_bin,
+        threads,
+        level,
+        rep,
+    )
+}
+
+/// Fair native baseline: 7-Zip-zstd non-solid multi-member with ZSTD/LZ4 method.
+fn native_zs_method(
+    codec: CodecKind,
+    out_root: &Path,
+    tree: &Path,
+    sevenz_zs: &Path,
+    threads: u32,
+    level: u32,
+    rep: u32,
+) -> NativeResult {
+    let mx = codec.zs_mx(level);
+    let out = out_root.join(format!(
+        "native-zs-{}-t{}-l{}-r{}.7z",
+        codec.name(),
+        threads,
+        level,
+        rep
+    ));
+    let _ = fs::remove_file(&out);
+    let mut cmd = Command::new(sevenz_zs);
+    cmd.arg("a")
+        .arg("-t7z")
+        .arg(format!("-m0={}", codec.method_flag()))
+        .arg(format!("-mx={mx}"))
+        .arg(format!("-mmt={threads}"))
+        .arg("-ms=off")
+        .arg("-bso0")
+        .arg("-bsp0")
+        .arg(out.as_os_str())
+        .arg(format!("{}/.", tree.display()));
+    let mut timed = run_timed(cmd);
+    if timed.ok {
+        if !out.exists() {
+            timed.ok = false;
+            timed.note = "7zz-zstd reported ok but output missing".into();
+        } else {
+            timed.out_bytes = du_bytes(&out);
+            timed.note = format!(
+                "7-Zip-zstd -m0={} -ms=off -mx={mx} (mapped from our level {level})",
+                codec.method_flag()
+            );
+        }
+    }
+    NativeResult {
+        tool: codec.zs_tool_label().into(),
+        timed,
+    }
+}
+
+/// Non-solid native **proxy** for zstd/lz4 when 7-Zip-zstd is unavailable:
 /// 1) compress each file with CLI (up to `threads` parallel workers)
 /// 2) pack compressed blobs into non-solid 7z via `7zz -m0=Copy -ms=off`
-///
-/// Stock 7zz cannot encode ZSTD/LZ4 methods inside .7z; this is the fair layout peer.
 fn native_codec_store(
     codec: CodecKind,
     out_root: &Path,
@@ -515,18 +677,21 @@ fn native_codec_store(
 ) -> NativeResult {
     let Some(cbin) = codec_bin else {
         return NativeResult {
-            tool: codec.tool_label(),
+            tool: codec.proxy_tool_label().into(),
             timed: Timed {
                 wall: Duration::ZERO,
                 out_bytes: 0,
                 ok: false,
-                note: format!("{} CLI not found", codec.name()),
+                note: format!(
+                    "{} CLI not found; also install 7zz-zstd for fair baseline",
+                    codec.name()
+                ),
             },
         };
     };
     let Some(sz) = sevenz else {
         return NativeResult {
-            tool: codec.tool_label(),
+            tool: codec.proxy_tool_label().into(),
             timed: Timed {
                 wall: Duration::ZERO,
                 out_bytes: 0,
@@ -638,7 +803,7 @@ fn native_codec_store(
     }
 
     NativeResult {
-        tool: codec.tool_label(),
+        tool: codec.proxy_tool_label().into(),
         timed: result.unwrap_or_else(|e| Timed {
             wall: start.elapsed(),
             out_bytes: 0,
@@ -721,7 +886,7 @@ fn compress_one_file(
 fn print_row(method: &str, tool: &str, threads: u32, level: u32, input: u64, t: &Timed) {
     if !t.ok {
         println!(
-            "{:<8} {:<16} {:>7} {:>10} {:>10} {:>10} {:>8} {:>8}  FAIL {}",
+            "{:<8} {:<18} {:>7} {:>10} {:>10} {:>10} {:>8} {:>8}  FAIL {}",
             method,
             tool,
             threads,
@@ -744,7 +909,7 @@ fn print_row(method: &str, tool: &str, threads: u32, level: u32, input: u64, t: 
     };
     let mibs = in_mib / sec;
     println!(
-        "{:<8} {:<16} {:>7} {:>10} {:>10.3} {:>10.3} {:>8.2} {:>8.1}  {}",
+        "{:<8} {:<18} {:>7} {:>10} {:>10.3} {:>10.3} {:>8.2} {:>8.1}  {}",
         method,
         tool,
         threads,

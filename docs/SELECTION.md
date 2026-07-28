@@ -314,16 +314,97 @@ After normal include/exclude selection (and collision checks), optional per-dire
 
 - **PATH** — archive-relative directory prefix (trailing `/` optional; normalized like member paths; no `..`).
 - **SIZE** — same syntax as encode budgets (`100M`, `1G`, `500K`, raw bytes).
-- **Order of operations:** rsync filters first → budget post-process on the candidate list.
+- **Order of operations:** rsync filters → per-file size/age limits (if any) → budget post-process on the candidate list.
 - **Scope:** recursive regular files whose `archive_name` is under `PATH/` (not a file named exactly `PATH`).
 - **Ordering:** under each budget, sort by **mtime descending**, then `archive_name` ascending.
 - **Accumulation:** include while `running_sum + size ≤ limit`; further files are **budget-skips** (not rsync excludes).
 - **Nesting:** if multiple budgets match a file, the **longest matching prefix** wins; budgets apply independently per group.
-- **Logging:** each budget-skip is logged at warn with path, size, mtime, budget dir/limit, running sum.
+- **Logging (compact):** one stderr block per budgeted dir after selection — summary line with kept/skip counts and byte totals, then `kept:` / `skip:` path:size lists (capped; `+N` for overflow). No per-file warn spam.
 - **Counters:** `SelectionStats.skipped_dir_budget`.
+- **Dry-run:** same `build_selection` path as write; restriction report on stderr; selected names on stdout.
+
+Implementation: `src/select/dir_budget.rs` (`RestrictionReport`).
+
+---
+
+## Directory file-count limits (`--dir-max-files`)
+
+After filters and optional size budgets, optional per-directory **file-count**
+limits cap how many selected files are kept under a directory **tree**.
+
+| Flag | Format | Example |
+|------|--------|---------|
+| `--dir-max-files` (repeatable) | `PATH=N` | `--dir-max-files logs/=10` |
+| `--dir-max-files-from` | file of `PATH=N` lines | `--dir-max-files-from limits.txt` |
+
+- **PATH** — archive-relative directory prefix (trailing `/` optional; same normalization as size budgets; no `..`).
+- **N** — non-negative integer (max files kept under the tree).
+- **Order of operations:** rsync filters → per-file size/age (if any) → `--dir-max-size` → file-count limits → global caps.
+- **Scope:** **recursive** under `PATH/` (same as size budgets). Nested limits: **longest matching prefix** wins. Collection filters are an independent rule set.
+- **Ordering:** under each limit, sort by **mtime descending**, then `archive_name` ascending; keep the first `N`.
+- **List file:** blank lines and `#` comments skipped; same size/line caps as other from-files; duplicate prefixes (CLI ↔ file) error.
+- **Logging (compact):** same style as size budgets — `dir-max-files PATH/=N: kept … skip …` plus path:size lists.
+- **Counters:** `SelectionStats.skipped_dir_file_limit`.
 - **Dry-run:** same `build_selection` path as write.
 
-Implementation: `src/select/dir_budget.rs`.
+Implementation: `src/select/dir_budget.rs` (`DirFileLimit`, `apply_dir_file_limits`, `RestrictionReport`).
+
+---
+
+## Global / log-collection restrictions
+
+Post-filter caps for size-cautious packs (e.g. off-host logs). Same path for dry-run and write.
+Soft-fail: excess files are **skipped** with a compact stderr report (not hard error unless the
+final selection is empty on write).
+
+### Order of operations (`build_selection`)
+
+1. Rsync filters / walk (`--include` / `--exclude` / `--files-from`, …)
+2. **Per-file:** `--max-size`, `--min-size`, `--newer-than`
+3. **Directory:** `--dir-max-size` then `--dir-max-files` / `--dir-max-files-from`
+4. **Global:** `--max-total-size` then `--max-files`
+
+| Flag | Format | Behavior |
+|------|--------|----------|
+| `--max-size SIZE` | same as encode budgets (`100M`, …) | Skip any single file with `size > SIZE` |
+| `--min-size SIZE` | same | Skip files with `size < SIZE`; **`0` or omit = off** |
+| `--newer-than DURATION` | `7d` / `24h` / `30m` / `90s` / bare seconds | Keep only files with mtime ≥ now − DURATION |
+| `--max-total-size SIZE` | same size syntax | Global selected-byte cap; **newest mtime first**, then `archive_name` asc; keep while `sum + size ≤ limit` |
+| `--max-files N` | non-negative integer | Global max member count; **newest mtime first** |
+
+- **Logging (compact):** stderr blocks such as `max-size: skip N (bytes)`, `min-size: …`,
+  `newer-than: …`, `max-total-size=…: kept … skip …`, `max-files=N: kept … skip …` with
+  capped path:size lists (`+N` overflow). Shared with dir restriction report.
+- **Counters:** `SelectionStats.skipped_max_size`, `skipped_min_size`, `skipped_older_than`,
+  `skipped_max_total_size`, `skipped_max_files`.
+- **Duration parse:** integer + optional suffix `d`/`h`/`m`/`s` only (no floats).
+
+Implementation: `src/select/global_restrict.rs`; report fields on `RestrictionReport`.
+
+---
+
+## Future restriction ideas (log collection / size-cautious)
+
+Brainstorm for off-host log/forensic packs (not all implemented). Prefer options that fail soft with a compact report.
+
+| Idea | Flag sketch | Why useful |
+|------|-------------|------------|
+| ~~Global archive size budget~~ | **`--max-total-size`** | **Done** |
+| ~~Global file count~~ | **`--max-files`** | **Done** |
+| ~~Per-file max/min size~~ | **`--max-size` / `--min-size`** | **Done** |
+| ~~Age window (recent)~~ | **`--newer-than`** | **Done** (`--older-than` still open) |
+| Head/tail of large files | `--file-head-bytes` / `--file-tail-bytes` | Sample huge logs without full copy |
+| Free-disk guard | `--min-free-space SIZE` | Refuse write if destination volume too full |
+| Output path quota | `--output-max-size` | Stop encoding when archive would exceed |
+| Rate / inode cap | `--max-inodes` / walk depth | Huge trees under `/var` |
+| Dedup by content hash | optional later | Same rotated log hardlinks |
+| Priority paths | `--prefer PATH` newest-first global | Incident dirs first under global budget |
+| Sample rate | `--sample 1/N` | Statistical collect when full pack impossible |
+| Deny patterns always | already: `--exclude` | Secrets, keys, `/proc` |
+| Soft vs hard fail | `--restriction-strict` | Empty after limits → error vs empty dry-run ok |
+| Older-than / absolute mtime | `--older-than` / `--mtime-after` | Full age window |
+
+See also Stage 9 in `docs/DESIGN.md`.
 
 ---
 
@@ -340,4 +421,8 @@ Implementation: `src/select/dir_budget.rs`.
 | `**` | across segments |
 | Filter file caps | 10 MiB / 1M lines |
 | Merge / dir-merge | **not** implemented |
-| Dir size budgets | newest-mtime-first; longest prefix; post-filter |
+| Dir size budgets | newest-mtime-first; recursive under PATH/; longest prefix; post-filter |
+| Dir file-count limits | newest-mtime-first; **recursive** under PATH/; longest prefix; post-filter |
+| Per-file max/min size | `--max-size` / `--min-size` (`0`=off); after filters, before dir budgets |
+| Newer-than | `--newer-than` duration (`7d`/`24h`/`30m`/`s`); mtime window |
+| Global max-total-size / max-files | newest-mtime-first; after dir limits |

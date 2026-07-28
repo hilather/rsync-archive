@@ -22,10 +22,14 @@ pub use pipeline::{
     cleanup_partial, commit_output, output_exists, partial_path_for, prepare_output, OutputPaths,
 };
 pub use select::{
-    apply_dir_budgets, archive_name_for, collect_from_files_from, collect_from_sources,
-    load_exclude_from, load_filter_from, load_include_from, parse_dir_budgets,
-    parse_dir_max_size_arg, parse_rule, DirBudget, Rule, RuleAction, RuleSet, SelectedEntry,
-    SelectionStats, SourceKind, SourceSpec,
+    apply_dir_budgets, apply_dir_file_limits, apply_max_files, apply_max_total_size,
+    apply_per_file_limits, archive_name_for, collect_dir_file_limits, collect_from_files_from,
+    collect_from_sources, load_dir_max_files_from, load_exclude_from, load_filter_from,
+    load_include_from, parse_dir_budgets, parse_dir_file_limits, parse_dir_max_files_arg,
+    parse_dir_max_size_arg, parse_duration_secs, parse_rule, per_file_limits_from_cli, DirBudget,
+    DirBudgetOutcome, DirFileLimit, DirFileLimitOutcome, GlobalCountCapOutcome,
+    GlobalSizeCapOutcome, PerFileLimits, RestrictionFile, RestrictionReport, Rule, RuleAction,
+    RuleSet, SelectedEntry, SelectionStats, SourceKind, SourceSpec,
 };
 
 /// Library version (same as package).
