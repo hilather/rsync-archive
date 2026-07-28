@@ -1,0 +1,160 @@
+# First-class release: tag v* → multi-distro build artifacts + GitHub Release.
+#
+# Assets: release binaries named rsync-archive-<os>-x86_64
+# Built with default features (portable pure-Rust codecs).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0); only for manual re-run"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-ubuntu:
+    name: release-build (ubuntu ${{ matrix.ver }})
+    runs-on: ubuntu-${{ matrix.ver }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ver: ["22.04", "24.04"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-ubuntu-${{ matrix.ver }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin rsync-archive
+
+      - name: Package
+        run: |
+          set -eux
+          BIN=rsync-archive-ubuntu${{ matrix.ver }}-x86_64
+          cp target/release/rsync-archive "$BIN"
+          chmod +x "$BIN"
+          tar -czf "${BIN}.tar.gz" "$BIN"
+          sha256sum "${BIN}.tar.gz" > "${BIN}.tar.gz.sha256"
+          ./target/release/rsync-archive --version | tee version.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu${{ matrix.ver }}-x86_64
+          path: |
+            rsync-archive-ubuntu${{ matrix.ver }}-x86_64.tar.gz
+            rsync-archive-ubuntu${{ matrix.ver }}-x86_64.tar.gz.sha256
+          if-no-files-found: error
+
+  build-rocky:
+    name: release-build (rocky ${{ matrix.rocky }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rocky: ["8", "9", "10"]
+    container:
+      image: rockylinux/rockylinux:${{ matrix.rocky }}
+    steps:
+      - name: Install build dependencies
+        run: |
+          set -eux
+          dnf -y install gcc gcc-c++ make curl ca-certificates git openssl-devel pkgconf-pkg-config tar gzip
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          set -eux
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build release binary
+        run: |
+          set -eux
+          source "$HOME/.cargo/env" 2>/dev/null || true
+          cargo build --release --locked --bin rsync-archive
+
+      - name: Package
+        run: |
+          set -eux
+          BIN=rsync-archive-rocky${{ matrix.rocky }}-x86_64
+          cp target/release/rsync-archive "$BIN"
+          chmod +x "$BIN"
+          tar -czf "${BIN}.tar.gz" "$BIN"
+          sha256sum "${BIN}.tar.gz" > "${BIN}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rocky${{ matrix.rocky }}-x86_64
+          path: |
+            rsync-archive-rocky${{ matrix.rocky }}-x86_64.tar.gz
+            rsync-archive-rocky${{ matrix.rocky }}-x86_64.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish GitHub Release
+    needs: [build-ubuntu, build-rocky]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List assets
+        run: find dist -type f | sort
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## rsync-archive ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+
+            First multi-distro release builds (x86_64, default features).
+
+            ### Supported CI targets
+            | Distro | Versions |
+            |--------|----------|
+            | Ubuntu LTS | 22.04, 24.04 |
+            | Rocky Linux | 8, 9, 10 |
+
+            ### Assets
+            Download the tarball matching your OS (glibc-linked; built on that distro).
+
+            ```bash
+            tar -xzf rsync-archive-<distro>-x86_64.tar.gz
+            ./rsync-archive-<distro>-x86_64 --version
+            ```
+
+            Default features: pure-Rust LZMA2 + zstd + lz4_flex (no system liblzma required).
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,125 @@
+# Build-only CI across supported Ubuntu LTS and Rocky Linux majors.
+#
+# Ubuntu: GitHub-hosted runners (22.04, 24.04).
+# Rocky: container jobs on ubuntu-latest (8, 9, 10).
+#
+# Default features only (pure-Rust codecs; no system liblzma required).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Ubuntu LTS (native runners)
+  # -------------------------------------------------------------------------
+  build-ubuntu:
+    name: build (ubuntu ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # GHA-supported Ubuntu LTS runners (20.04 retired from GHA).
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-${{ matrix.os }}
+
+      - name: Build (release)
+        run: cargo build --release --locked --bins
+
+      - name: Smoke binary
+        run: |
+          ./target/release/rsync-archive --version
+          ./target/release/rsync-archive create --help | head -5
+
+  # -------------------------------------------------------------------------
+  # Rocky Linux (containers)
+  # -------------------------------------------------------------------------
+  build-rocky:
+    name: build (rocky ${{ matrix.rocky }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Supported Rocky majors with official images (rockylinux/rockylinux).
+        rocky: ["8", "9", "10"]
+    container:
+      image: rockylinux/rockylinux:${{ matrix.rocky }}
+    steps:
+      - name: Install build dependencies
+        run: |
+          set -eux
+          # Rocky 8 uses dnf modules; all have dnf.
+          dnf -y install \
+            gcc \
+            gcc-c++ \
+            make \
+            curl \
+            ca-certificates \
+            git \
+            openssl-devel \
+            pkgconf-pkg-config
+          # cmake not strictly required for default features; keep build tools lean.
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          set -eux
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build (release)
+        run: |
+          set -eux
+          source "$HOME/.cargo/env" 2>/dev/null || true
+          rustc --version
+          cargo --version
+          cargo build --release --locked --bins
+
+      - name: Smoke binary
+        run: |
+          set -eux
+          ./target/release/rsync-archive --version
+          ./target/release/rsync-archive create --help | head -5
+
+  # -------------------------------------------------------------------------
+  # Full test suite once (fast feedback; not matrixed)
+  # -------------------------------------------------------------------------
+  test:
+    name: test (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test-ubuntu-24.04
+
+      - name: Test
+        run: cargo test --locked --all-targets

@@ -2,6 +2,9 @@
 
 **Stream-create non-solid 7z** archives from the filesystem using **rsync-style path selection**, and **embed** finished archives under a master store 7z (Copy method, no recompress).
 
+[![CI](https://github.com/hilather/rsync-archive/actions/workflows/ci.yml/badge.svg)](https://github.com/hilather/rsync-archive/actions/workflows/ci.yml)
+[![Release](https://github.com/hilather/rsync-archive/actions/workflows/release.yml/badge.svg)](https://github.com/hilather/rsync-archive/actions/workflows/release.yml)
+
 | | |
 |--|--|
 | **Status** | Stages 2–6 done; **`create` and `embed` work** (non-solid 7z) |
@@ -244,6 +247,23 @@ cargo build --release --bin rsync-archive --bin bench_compress
 ```
 
 Docs: [`docs/BENCH.md`](docs/BENCH.md) · published numbers: [`docs/bench/RESULTS.md`](docs/bench/RESULTS.md)
+
+---
+
+## CI and releases
+
+| Workflow | When | What |
+|----------|------|------|
+| **CI** (`.github/workflows/ci.yml`) | push/PR to `main` | **Build** on Ubuntu **22.04** / **24.04** and Rocky Linux **8** / **9** / **10**; full `cargo test` on Ubuntu 24.04 |
+| **Release** (`.github/workflows/release.yml`) | tag `v*` | Release binaries per distro + GitHub Release assets |
+
+```bash
+# Cut a release (maintainers)
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+Rocky builds run in official `rockylinux/rockylinux` containers. Ubuntu uses GitHub-hosted runners.
 
 ---
 
