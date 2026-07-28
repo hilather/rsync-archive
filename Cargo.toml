@@ -20,6 +20,7 @@ path = "src/lib.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 crc32fast = "1"
+sevenz-rust2 = { version = "0.21", features = ["util"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -27,5 +28,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
-sevenz-rust2 = { version = "0.21", features = ["compress", "util"] }
 tempfile = "3"

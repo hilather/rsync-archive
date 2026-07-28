@@ -4,7 +4,7 @@
 
 | | |
 |--|--|
-| **Status** | Stages 2 + 4 done (store writer + filter engine); create/embed pipelines not implemented yet |
+| **Status** | Stages 2–4 done; **`embed` works**; `create` still not implemented |
 | **Selection** | [`docs/SELECTION.md`](docs/SELECTION.md) (rsync include/exclude v1) |
 | **License** | MIT |
 | **Design** | [`docs/DESIGN.md`](docs/DESIGN.md) |
@@ -51,9 +51,12 @@ cargo run -- --help
 cargo run -- create --help
 cargo run -- embed --help
 
-# These currently exit with "not implemented" after flag validation:
+# create still not implemented:
 # cargo run -- create -o out.7z ./src
-# cargo run -- embed -o master.7z a.7z b.7z
+
+# embed finished files under a master store 7z:
+cargo run -- embed -o master.7z --allow-any a.bin b.bin
+cargo run -- embed -o master.7z --force --verify nest1.7z nest2.7z
 ```
 
 ### Planned `create` (from design)
@@ -69,13 +72,16 @@ rsync-archive create -o out.7z --files-from list.txt --dry-run
 rsync-archive create -o out.7z --force --level 5 --verify /data/tree
 ```
 
-### Planned `embed` (from design)
+### `embed` (Stage 3 — implemented)
 
 ```bash
 rsync-archive embed -o master.7z nest1.7z nest2.7z
-rsync-archive embed -o master.7z --keep-path --prefix packs/ ./build/*.7z
+rsync-archive embed -o master.7z --keep-path --prefix packs/ ./build/a.7z
 rsync-archive embed -o master.7z --require-7z --verify a.7z b.7z
+rsync-archive embed -o master.7z --allow-any --dry-run blob.bin
 ```
+
+Default naming flattens to **basename**. Missing 7z magic **warns** (stderr log) unless `--require-7z` (error) or `--allow-any` (silent). Write uses `OUT.partial` then rename; refuse overwrite without `--force`.
 
 ---
 
@@ -129,7 +135,7 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for stages and PR plan.
 | 0 Bootstrap + agent docs/tests policy | **Done** |
 | 1 Foundations (errors, pathnorm, output helpers) | **Done** |
 | 2 7z header + store writer | **Done** (library: `NonsolidStoreWriter` Copy / method `0x00`; embed foundation) |
-| 3 Embed pipeline | Planned |
+| 3 Embed pipeline | **Done** — `rsync-archive embed` (store/Copy, atomic partial, dry-run, verify) |
 | 4 Rsync filter engine | **Done** — see [`docs/SELECTION.md`](docs/SELECTION.md) |
 | 5 Walk + create dry-run | Planned |
 | 6 Create LZMA2 write | Planned |
@@ -143,15 +149,12 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for stages and PR plan.
 ```text
 src/
   main.rs, cli.rs, lib.rs, error.rs
-<<<<<<< HEAD
   archive/sevenz/    # non-solid header + NonsolidStoreWriter (Copy) for embed
-  select/            # SourceSpec, pathnorm (filters/walk later)
-=======
   select/            # SourceSpec, pathnorm, rules/matcher/from_file (walk later)
->>>>>>> a2901b8 (feat(select): frozen v1 rsync include/exclude engine)
   pipeline/output.rs # partial path, --force check, rename helpers
   util/              # tracing init
-  # later: archive/sevenz/lzma2_writer, pipeline/{create,embed}
+  pipeline/embed.rs  # embed command (store outer)
+  # later: archive/sevenz/lzma2_writer, pipeline/create
 docs/
   DESIGN.md          # full design
   SELECTION.md       # filter semantics (Stage 4, frozen v1)

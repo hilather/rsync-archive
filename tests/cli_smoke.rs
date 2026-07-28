@@ -74,13 +74,40 @@ fn create_with_src_is_not_implemented_exit_1() {
 }
 
 #[test]
-fn embed_is_not_implemented_exit_1() {
+fn embed_missing_input_exits_1() {
     bin()
         .args(["embed", "-o", "master.7z", "a.7z"])
         .assert()
         .failure()
         .code(1)
-        .stderr(predicate::str::contains("not implemented"));
+        .stderr(predicate::str::contains("stat").or(predicate::str::contains("a.7z")));
+}
+
+#[test]
+fn embed_cli_roundtrip() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let a = dir.path().join("one.dat");
+    let b = dir.path().join("two.dat");
+    fs::write(&a, b"one").unwrap();
+    fs::write(&b, b"two").unwrap();
+    let out = dir.path().join("master.7z");
+    bin()
+        .args([
+            "embed",
+            "-o",
+            out.to_str().unwrap(),
+            "--allow-any",
+            "--verify",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert!(out.exists());
+    assert!(out.metadata().unwrap().len() > 32);
 }
 
 #[test]

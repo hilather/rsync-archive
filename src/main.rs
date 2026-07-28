@@ -36,8 +36,8 @@ fn run() -> std::result::Result<(), ExitError> {
                 "create (Stage 5–6b; dry-run in Stage 5, write in Stage 6/6b)",
             )))
         }
-        Command::Embed(_args) => Err(ExitError::Ops(Error::NotImplemented(
-            "embed (Stage 3)",
-        ))),
+        Command::Embed(args) => {
+            rsync_archive::pipeline::run_embed(args).map_err(ExitError::Ops)
+        }
     }
 }
