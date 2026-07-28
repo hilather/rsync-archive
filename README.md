@@ -4,7 +4,8 @@
 
 | | |
 |--|--|
-| **Status** | Stage 2 complete (header + Copy store writer); create/embed pipelines not implemented yet |
+| **Status** | Stages 2 + 4 done (store writer + filter engine); create/embed pipelines not implemented yet |
+| **Selection** | [`docs/SELECTION.md`](docs/SELECTION.md) (rsync include/exclude v1) |
 | **License** | MIT |
 | **Design** | [`docs/DESIGN.md`](docs/DESIGN.md) |
 | **Agent policy** | [`AGENTS.md`](AGENTS.md) (docs **and** tests required on every change) |
@@ -129,7 +130,7 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for stages and PR plan.
 | 1 Foundations (errors, pathnorm, output helpers) | **Done** |
 | 2 7z header + store writer | **Done** (library: `NonsolidStoreWriter` Copy / method `0x00`; embed foundation) |
 | 3 Embed pipeline | Planned |
-| 4 Rsync filter engine | Planned |
+| 4 Rsync filter engine | **Done** — see [`docs/SELECTION.md`](docs/SELECTION.md) |
 | 5 Walk + create dry-run | Planned |
 | 6 Create LZMA2 write | Planned |
 | 6b Streaming LZMA2 (v1 blocker) | Planned |
@@ -142,20 +143,37 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for stages and PR plan.
 ```text
 src/
   main.rs, cli.rs, lib.rs, error.rs
+<<<<<<< HEAD
   archive/sevenz/    # non-solid header + NonsolidStoreWriter (Copy) for embed
   select/            # SourceSpec, pathnorm (filters/walk later)
+=======
+  select/            # SourceSpec, pathnorm, rules/matcher/from_file (walk later)
+>>>>>>> a2901b8 (feat(select): frozen v1 rsync include/exclude engine)
   pipeline/output.rs # partial path, --force check, rename helpers
   util/              # tracing init
   # later: archive/sevenz/lzma2_writer, pipeline/{create,embed}
 docs/
   DESIGN.md          # full design
-  SELECTION.md       # filter semantics (Stage 4)
+  SELECTION.md       # filter semantics (Stage 4, frozen v1)
 AGENTS.md            # mandatory agent policy (docs + tests)
 .grok/skills/
   keep-docs-current/
   keep-tests-current/
-tests/               # cli_smoke + later e2e/parity
+tests/               # cli_smoke, filter_parity
 ```
+
+### Selection (Stage 4)
+
+Frozen rsync include/exclude engine (no merge, no walk yet):
+
+- Ordered first-match-wins; default **Include** if no rule matches
+- `--include` / `--exclude` / `--filter '+|-'` / include-from / exclude-from
+- Basename match when pattern has no `/` (`*.tmp` matches `dir/a.tmp`) — K27
+- Anchored `/pat`, dir-only `pat/`, wildcards `*` `**` `?`
+- Prune predicate for future walk (conservative: prefer walking too much)
+- Filter files capped at **10 MiB** / **1M lines**
+
+Details and parity table: [`docs/SELECTION.md`](docs/SELECTION.md).
 
 ---
 

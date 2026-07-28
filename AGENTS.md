@@ -113,7 +113,10 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | `src/error.rs` | Error types |
 | `src/main.rs` | Binary entry, exit codes |
 | `src/select/pathnorm.rs` | Archive path normalization; reject `..` |
-| `src/select/mod.rs` | `SourceSpec`, archive name mapping (filters/walk later) |
+| `src/select/mod.rs` | `SourceSpec`, archive name mapping; re-exports filter API |
+| `src/select/rules.rs` | `Rule`, `RuleAction`, `RuleSet`, pattern parse |
+| `src/select/matcher.rs` | Path match, `action_for`, `should_prune_dir` |
+| `src/select/from_file.rs` | include-from / exclude-from / filter files; size/line caps |
 | `src/pipeline/output.rs` | `*.partial` naming, `--force` check, rename commit |
 | `src/util/` | Tracing init (`-v` / `-vv`) |
 | `src/archive/mod.rs` | Archive module root; re-exports store writer API |
@@ -122,8 +125,8 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | `src/archive/sevenz/` | Headers + store writer; LZMA2 create writer (later) |
 | `src/pipeline/` | create / embed / verify (later) |
 | `docs/DESIGN.md` | Full design (stages, decisions) |
-| `docs/SELECTION.md` | Filter semantics (Stage 4+) |
-| `tests/` | e2e and parity (`cli_smoke` now) |
+| `docs/SELECTION.md` | **Filter semantics source of truth** (Stage 4 frozen v1; keep in sync with `src/select/`) |
+| `tests/` | e2e and parity (`cli_smoke`, `filter_parity`) |
 | `.grok/skills/keep-docs-current/` | Docs sync skill |
 | `.grok/skills/keep-tests-current/` | Regression test skill |
 
