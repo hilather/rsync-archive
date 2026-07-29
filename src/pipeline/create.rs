@@ -14,7 +14,9 @@ use crate::archive::sevenz::{
 use crate::archive::{write_seekable_zstd, write_tar_lz4, write_tar_zstd, NonsolidLzma2Writer};
 use crate::cli::{CreateArgs, OutputFormat};
 use crate::error::{Error, Result};
-use crate::pipeline::output::{cleanup_partial, commit_output, prepare_output};
+use crate::pipeline::output::{
+    cleanup_partial, commit_output, partial_path_for, prepare_output,
+};
 use crate::select::dir_budget::{
     apply_dir_budgets, apply_dir_file_limits, collect_dir_budgets, collect_dir_file_limits,
     RestrictionReport,
@@ -33,7 +35,7 @@ use crate::util::{
     resolve_encode_workers,
 };
 use std::collections::{BTreeMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -75,7 +77,7 @@ pub fn build_rules(args: &CreateArgs) -> Result<RuleSet> {
 /// Build the full selection (same path for dry-run and write).
 ///
 /// Order of operations:
-/// 1. Master list: rsync filters / walk or `--files-from`
+/// 1. Master list: rsync filters / walk or `--files-from`, optional `--include-cwd`
 /// 2. Global per-file `--max-size` / `--min-size` / `--newer-than`
 /// 3. `--file-size-from` (only paths matching a list line; first match wins)
 /// 4. `--dir-max-size` / `--dir-max-size-from` then `--dir-max-files` /
@@ -88,15 +90,23 @@ pub fn build_selection(
     args: &CreateArgs,
 ) -> Result<(Vec<SelectedEntry>, SelectionStats, RestrictionReport)> {
     let rules = build_rules(args)?;
-    let (entries, mut stats) = if let Some(list) = &args.files_from {
+    let (mut entries, mut stats) = if let Some(list) = &args.files_from {
         collect_from_files_from(list, &rules)?
-    } else {
+    } else if !args.sources.is_empty() {
         let mut specs = Vec::with_capacity(args.sources.len());
         for s in &args.sources {
             specs.push(SourceSpec::from_user_path(s)?);
         }
         collect_from_sources(&specs, &rules)?
+    } else {
+        (Vec::new(), SelectionStats::default())
     };
+
+    if args.include_cwd {
+        let (cwd_entries, cwd_stats) = collect_include_cwd(&rules, &args.output)?;
+        merge_selection(&mut entries, &mut stats, cwd_entries, cwd_stats)?;
+    }
+
     let mut report = RestrictionReport::default();
 
     // 2. Global per-file size / age filters.
@@ -140,6 +150,99 @@ pub fn build_selection(
     };
 
     Ok((entries, stats, report))
+}
+
+/// Walk process CWD with trailing-slash semantics (members at archive root).
+///
+/// Excludes the create `-o` path and its `.partial` sibling so the tool does not
+/// archive its own output/temp.
+fn collect_include_cwd(
+    rules: &RuleSet,
+    output: &Path,
+) -> Result<(Vec<SelectedEntry>, SelectionStats)> {
+    let cwd = std::env::current_dir().map_err(|e| {
+        Error::Selection(format!("cwd for --include-cwd: {e}"))
+    })?;
+    let spec = SourceSpec {
+        path: cwd,
+        original: "./".into(),
+        trailing_slash: true,
+        kind: crate::select::SourceKind::Dir,
+    };
+    let (entries, mut stats) = collect_from_sources(&[spec], rules)?;
+    let skip = output_artifact_paths(output);
+    let before = entries.len();
+    let filtered: Vec<SelectedEntry> = entries
+        .into_iter()
+        .filter(|e| !is_output_artifact(&e.abs_path, &skip))
+        .collect();
+    let dropped = before.saturating_sub(filtered.len());
+    if dropped > 0 {
+        // Counted as excluded rather than special; these are intentional self-skips.
+        stats.skipped_excluded = stats.skipped_excluded.saturating_add(dropped as u64);
+        debug!(
+            dropped,
+            output = %output.display(),
+            "include-cwd skipped self output/partial"
+        );
+    }
+    stats.selected = filtered.len() as u64;
+    Ok((filtered, stats))
+}
+
+/// Paths to skip when packing CWD: final `-o` and `{out}.partial` (absolute form).
+fn output_artifact_paths(output: &Path) -> (PathBuf, PathBuf) {
+    let final_abs = std::path::absolute(output).unwrap_or_else(|_| output.to_path_buf());
+    let partial = partial_path_for(output);
+    let partial_abs = std::path::absolute(&partial).unwrap_or(partial);
+    (final_abs, partial_abs)
+}
+
+fn is_output_artifact(abs: &Path, skip: &(PathBuf, PathBuf)) -> bool {
+    let abs = std::path::absolute(abs).unwrap_or_else(|_| abs.to_path_buf());
+    paths_equal(&abs, &skip.0) || paths_equal(&abs, &skip.1)
+}
+
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    // Best-effort when both exist: same file via canonicalize.
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+/// Append `extra` into `base`, merging stats; collision on archive_name errors.
+fn merge_selection(
+    base: &mut Vec<SelectedEntry>,
+    base_stats: &mut SelectionStats,
+    extra: Vec<SelectedEntry>,
+    extra_stats: SelectionStats,
+) -> Result<()> {
+    use std::collections::HashSet;
+    let mut names: HashSet<String> = base.iter().map(|e| e.archive_name.clone()).collect();
+    for e in extra {
+        if !names.insert(e.archive_name.clone()) {
+            return Err(Error::Collision(e.archive_name));
+        }
+        base.push(e);
+    }
+    base_stats.selected = base.len() as u64;
+    base_stats.skipped_excluded = base_stats
+        .skipped_excluded
+        .saturating_add(extra_stats.skipped_excluded);
+    base_stats.skipped_symlinks = base_stats
+        .skipped_symlinks
+        .saturating_add(extra_stats.skipped_symlinks);
+    base_stats.skipped_hardlinks = base_stats
+        .skipped_hardlinks
+        .saturating_add(extra_stats.skipped_hardlinks);
+    base_stats.skipped_special = base_stats
+        .skipped_special
+        .saturating_add(extra_stats.skipped_special);
+    Ok(())
 }
 
 /// Drop link members for formats that only pack regular files (7z, seekable-zstd).
@@ -820,6 +923,7 @@ pub(crate) fn test_create_args(
         exclude_from: None,
         include_from: None,
         files_from: None,
+        include_cwd: false,
         filter: vec![],
         level: 5,
         method: "lzma2".into(),

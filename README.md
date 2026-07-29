@@ -110,6 +110,8 @@ Default create remains **non-solid 7z** with **`--method lzma2`**.
 
 **Trailing `/` on SRC** strips the directory name from archive paths (`photos/` → `a.jpg`; `photos` → `photos/a.jpg`).  
 **`--files-from`:** exclusive of `SRC...`; relative lines keep path as member name; absolute lines use basename.  
+**`--include-cwd`:** (off by default) also pack files under the process CWD at **archive root** (like a trailing `/` on `.`); skips the `-o` output and its `.partial` temp. May be used alone or with `SRC...` / `--files-from`.  
+
 **Filters:** see [`docs/SELECTION.md`](docs/SELECTION.md). Rule build order: include-from → exclude-from → `--filter` → `--include` → `--exclude` (use `--filter` for strict interleaving).  
 **Restriction list files** (only matching paths/prefixes; others ignore that list):  
 - **`--file-size-from`:** rsync-like `PATTERN max=SIZE` (no min; first match wins).  
@@ -151,6 +153,7 @@ Default naming flattens to **basename**. Missing 7z magic **warns** (stderr log)
 | `--exclude` / `--include` | — | Rsync-style patterns (repeatable) |
 | `--exclude-from` / `--include-from` | — | Pattern files |
 | `--files-from` | — | Master collect list (exclusive of `SRC...`) |
+| `--include-cwd` | off | Pack CWD files at archive root; skip `-o` / `.partial` |
 | `--file-size-from` | — | Per-path max size list (`PATTERN max=SIZE`; only matches) |
 | `--dir-max-size-from` | — | Dir size/count list (`DIR/ max=SIZE [files=N]`) |
 | `--filter` | — | `+ pattern` / `- pattern` (repeatable) |
@@ -280,8 +283,8 @@ Docs: [`docs/BENCH.md`](docs/BENCH.md) · published numbers: [`docs/bench/RESULT
 
 ```bash
 # Cut a release (maintainers)
-git tag -a v0.3.0 -m "v0.3.0"
-git push origin v0.3.0
+git tag -a v0.4.0 -m "v0.4.0"
+git push origin v0.4.0
 ```
 
 Rocky builds run in official `rockylinux/rockylinux` containers. Ubuntu uses GitHub-hosted runners.

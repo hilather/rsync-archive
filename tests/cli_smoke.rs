@@ -46,6 +46,7 @@ fn create_help_shows_key_flags() {
         .stdout(predicate::str::contains("--force"))
         .stdout(predicate::str::contains("--exclude"))
         .stdout(predicate::str::contains("--files-from"))
+        .stdout(predicate::str::contains("--include-cwd"))
         .stdout(predicate::str::contains("--level"))
         .stdout(predicate::str::contains("--threads"))
         .stdout(predicate::str::contains("--encode-size-budget"))
@@ -89,7 +90,11 @@ fn create_without_src_or_files_from_is_usage_error() {
         .assert()
         .failure()
         .code(2)
-        .stderr(predicate::str::contains("SRC").or(predicate::str::contains("files-from")));
+        .stderr(
+            predicate::str::contains("SRC")
+                .or(predicate::str::contains("files-from"))
+                .or(predicate::str::contains("include-cwd")),
+        );
 }
 
 #[test]
@@ -205,6 +210,7 @@ fn create_validate_unit_rejects_both_modes() {
         exclude_from: None,
         include_from: None,
         files_from: Some(PathBuf::from("list.txt")),
+        include_cwd: false,
         filter: vec![],
         level: 5,
         method: "lzma2".into(),
@@ -242,6 +248,7 @@ fn create_validate_unit_accepts_sources_only() {
         exclude_from: None,
         include_from: None,
         files_from: None,
+        include_cwd: false,
         filter: vec![],
         level: 5,
         method: "lzma2".into(),

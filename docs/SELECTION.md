@@ -340,7 +340,7 @@ Walk and `--files-from` select:
 
 | Role | Flag(s) | Applied to |
 |------|---------|------------|
-| **Master collect** | `SRC...` **or** `--files-from` | What enters the candidate set |
+| **Master collect** | `SRC...` and/or `--files-from` and/or **`--include-cwd`** | What enters the candidate set |
 | **Rsync include/exclude** | `--include`/`--exclude`/`--filter` + `*-from` | Filter master set |
 | **Per-path file size** | **`--file-size-from`** | Only paths matching a line; others **ignore** this list |
 | **Dir byte/count** | `--dir-max-size`, **`--dir-max-size-from`**, `--dir-max-files`, `--dir-max-files-from` | Only listed directory prefixes; others **ignore** |
@@ -443,7 +443,18 @@ final selection is empty on write).
 
 ### Order of operations (`build_selection`)
 
-1. Master list: rsync filters / walk (`--include` / `--exclude` / `--files-from`, …)
+1. Master list: rsync filters / walk (`--include` / `--exclude` / `--files-from` / optional **`--include-cwd`**, …)
+
+### `--include-cwd` (optional, default off)
+
+When set, walk the **process current working directory** with trailing-slash semantics:
+member names are archive-**root** relative (`./a.txt` → `a.txt`, not `cwdname/a.txt`).
+
+- Combines with `SRC...` or `--files-from` (merge; `archive_name` collisions error).
+- May be used **alone** (no `SRC` / `--files-from`).
+- Always skips the create **`-o`** path and its **`{out}.partial`** sibling so the tool
+  does not archive its own output or in-progress temp.
+- Same include/exclude / restriction pipeline as other selected files.
 2. **Global per-file:** `--max-size`, `--min-size`, `--newer-than` (all candidates)
 3. **`--file-size-from`:** only matching patterns (first match wins)
 4. **Directory:** `--dir-max-size` / `--dir-max-size-from` then `--dir-max-files` / `--dir-max-files-from`

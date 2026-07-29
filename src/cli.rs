@@ -86,6 +86,7 @@ Tar formats include regular files, derived directory members, symlinks, and Unix
 rsync-archive create -o out.7z --method zstd --level 5 ./data/\n  \
 rsync-archive create -o logs.tar.zst --max-total-size 100M --dir-max-files logs/=50 /var/log/\n  \
 rsync-archive create -o o.7z --files-from master.txt --file-size-from sizes.txt --dir-max-size-from dirs.txt\n  \
+rsync-archive create -o pack.7z --include-cwd -n   # CWD files at archive root; skip pack.7z\n  \
 rsync-archive create -o pack.tlz4 -n ./tree/   # dry-run; .tlz4 → tar-lz4\n  \
 rsync-archive create -o o.7z --exclude '*.tmp' --newer-than 7d ./src/\n\n\
 See docs/SELECTION.md for list-file formats and filter semantics; docs/FORMAT_TAR_*.md for tar layouts."
@@ -134,6 +135,13 @@ pub struct CreateArgs {
     /// Explicit path list (exclusive of SRC...; relative to CWD unless absolute).
     #[arg(long = "files-from", value_name = "FILE")]
     pub files_from: Option<PathBuf>,
+
+    /// Also pack all files under the process CWD at archive root (trailing-`/` style).
+    ///
+    /// Off by default. Skips the `-o` output file and its `.partial` temp. Combines
+    /// with SRC... or `--files-from`, or may be used alone. Same include/exclude rules apply.
+    #[arg(long = "include-cwd", default_value_t = false)]
+    pub include_cwd: bool,
 
     /// Filter rule such as `+ *.rs` or `- *.tmp` (repeatable; ordered).
     #[arg(long = "filter", value_name = "RULE", action = clap::ArgAction::Append)]
@@ -214,7 +222,8 @@ pub struct CreateArgs {
     #[arg(long = "verify")]
     pub verify: bool,
 
-    /// Source paths (dirs/files). Required unless `--files-from`. Trailing `/` strips dir name.
+    /// Source paths (dirs/files). Required unless `--files-from` or `--include-cwd`.
+    /// Trailing `/` strips dir name.
     #[arg(value_name = "SRC")]
     pub sources: Vec<String>,
 }
@@ -280,7 +289,9 @@ impl CreateArgs {
                     "cannot combine --files-from with SRC... (use one or the other)".into(),
                 );
             }
-            (false, false) => return Err("need SRC... or --files-from".into()),
+            (false, false) if !self.include_cwd => {
+                return Err("need SRC..., --files-from, or --include-cwd".into());
+            }
             _ => {}
         }
 
@@ -388,6 +399,7 @@ mod tests {
             exclude_from: None,
             include_from: None,
             files_from: None,
+            include_cwd: false,
             filter: vec![],
             level: 5,
             method: "zstd".into(),
