@@ -10,6 +10,8 @@ use super::dir_budget::{
     GlobalCountCapOutcome, GlobalSizeCapOutcome, RestrictionFile, RestrictionReport,
 };
 use super::walk::{SelectedEntry, SelectionStats};
+#[cfg(test)]
+use super::walk::MemberKind;
 use crate::error::{Error, Result};
 use crate::util::parse_byte_size;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -306,6 +308,12 @@ mod tests {
             archive_name: rel.replace('\\', "/"),
             size: data.len() as u64,
             mtime_unix,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            uname: String::new(),
+            gname: String::new(),
+            kind: MemberKind::File,
         }
     }
 
@@ -461,6 +469,12 @@ mod tests {
             archive_name: "x".into(),
             size: 1,
             mtime_unix: Some(1),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            uname: String::new(),
+            gname: String::new(),
+            kind: MemberKind::File,
         };
         let mut stats = SelectionStats::default();
         let mut report = RestrictionReport::default();

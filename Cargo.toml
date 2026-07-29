@@ -1,6 +1,6 @@
 [package]
 name = "rsync-archive"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Create non-solid 7z archives with rsync-style selection; embed finished archives under a master store 7z"
 license = "MIT"
@@ -49,6 +49,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
 zeekstd = "0.6.2"
 zstd = { version = "0.13", features = ["zstdmt"] }
+
+# Unix owner name lookup (getpwuid_r / getgrgid_r) for tar uname/gname.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"

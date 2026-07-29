@@ -303,6 +303,39 @@ Automated: `tests/filter_parity.rs` (extends this table).
 
 ---
 
+## Member kinds (files, symlinks, hard links)
+
+Walk and `--files-from` select:
+
+| Kind | How | `SelectedEntry` | Size |
+|------|-----|-----------------|------|
+| Regular file | `symlink_metadata` is file; first path for its inode | `MemberKind::File` | content length |
+| Hard link | Unix: same `(st_dev, st_ino)` as an earlier regular file | `MemberKind::HardLink { target }` (`target` = first path’s `archive_name`) | **0** |
+| Symbolic link | not followed; `read_link` target | `MemberKind::Symlink { target }` | **0** |
+| Special (fifo/socket/device) | skipped | — | — (counter `skipped_special`) |
+
+- **Hard-link detection (Unix only):** while selecting regular files, keep a map
+  `(dev, ino) → first archive_name`. The first occurrence is a full file body;
+  later paths for that inode become hard-link members (size 0 so dir budgets /
+  `--max-total-size` do not double-count content). Non-Unix builds treat every
+  regular file as `File` (no hard-link detection). Cross-device hard links do not
+  exist on Unix and need no special case.
+- Symlinks are **not** hard links: only `meta.is_file()` paths participate in the
+  inode map; symlink inodes never become `HardLink`.
+- Filters (`action_for`) apply to the link’s **archive path** (not the target).
+- Metadata for links uses **lstat** (`symlink_metadata`): mode/uid/gid/mtime.
+- Symlinks and hard links participate in collision checks, dir budgets (size 0),
+  and global `--max-files`.
+- **Format encoding:**
+  - **tar-zstd / tar-lz4:** emit symlink members (ustar typeflag `'2'`) and hard-link
+    members (typeflag `'1'`, linkname = first archive path / pax `linkpath` when long).
+  - **7z / seekable-zstd:** drop symlink and hard-link entries at create time
+    (`skipped_symlinks` / `skipped_hardlinks`); the first regular-file body for each
+    hard-linked inode remains.
+- Dry-run lists only members that the resolved **output format** will archive (after that filter).
+
+---
+
 ## Directory size budgets (`--dir-max-size`)
 
 After normal include/exclude selection (and collision checks), optional per-directory

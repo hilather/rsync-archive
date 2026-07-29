@@ -117,14 +117,48 @@ File-level random access via independent packs. Uses `zstd` (libzstd) and `lz4_f
 **IDs:** `CODEC-ZSTD-SEEKABLE-STREAM`  
 **Docs:** [`FORMAT_SEEKABLE_ZSTD.md`](FORMAT_SEEKABLE_ZSTD.md)
 
+### RA-friendly `tar.zst` create format
+
+**Status:** **Done (MVP)** — `create --format tar-zstd` / `*.tar.zst` / `*.tzst`  
+**ID:** `CODEC-TAR-ZSTD-RA`  
+**Docs:** [`FORMAT_TAR_ZSTD.md`](FORMAT_TAR_ZSTD.md), [`PLAN_TAR_ZSTD.md`](PLAN_TAR_ZSTD.md)  
+**Impl:** `src/archive/tar_zstd/` (+ shared `tar_common`)
+
+Valid ustar/pax tar + seekable Zstd + `RATAIDX1` index. Same `build_selection` restrictions.  
+**Meta (PR6 done):** `SelectedEntry.mode` / `uid` / `gid` filled at walk; written into ustar (pax for oversized ids) + index.  
+**uname/gname (done):** `SelectedEntry.uname` / `gname` via `getpwuid_r` / `getgrgid_r` at walk; ustar fields + pax when &gt;32 bytes; **headers only** (not in `RATAIDX1`).  
+**Directory members (done):** parent prefixes of selected files/symlinks/hardlinks emitted as ustar `typeflag='5'` (trailing `/`, size 0) and listed in `RATAIDX1` with `data_len=0`; empty dirs without selected members not included.  
+**Symbolic links (done):** walk selects symlinks (`MemberKind::Symlink`); tar-zstd/tar-lz4 emit `typeflag='2'` + linkname/pax `linkpath` (no body); 7z/seekable-zstd skip at encode.  
+**Hard links (done):** Unix walk/files-from map `(dev,ino)` → first `archive_name`; later paths are `MemberKind::HardLink` (size 0); tar-zstd/tar-lz4 emit `typeflag='1'`; 7z/seekable-zstd skip hard-link members (keep first file body).
+
 | Requirement | Detail |
 |-------------|--------|
 | Format | Zstd **seekable** multi-frame + seek table ([`zeekstd`](https://crates.io/crates/zeekstd)) |
-| Payload | Length-prefixed members + trailing `RAZSIDX1` index (name → uncompressed data offset) |
+| Payload | ustar/pax tar + EOA + trailing `RATAIDX1` index |
 | Use case | Single stream with byte-range reads; list/extract helpers for verify/tests |
 | Note | Distinct from per-file Zstd in non-solid 7z (`--method zstd`) |
 
-**Follow-ups (not MVP):** full `extract` subcommand, tar-compatible payload, parallel encode for this format.
+**Follow-ups (not meta):** full `extract` subcommand, parallel encode.  
+**System-tar create interop (done):** e2e soft-probe decompresses seekable payload via `decompress_tar_zstd_payload_to_tar_bytes` then `tar -tf` (nested dirs, files, symlinks, hardlinks); see [`FORMAT_TAR_ZSTD.md`](FORMAT_TAR_ZSTD.md) Interop.
+
+### RA-friendly `tar.lz4` create format
+
+**Status:** **Done (MVP)** — `create --format tar-lz4` / `*.tar.lz4` / `*.tlz4`  
+**ID:** `CODEC-TAR-LZ4-RA`  
+**Docs:** [`FORMAT_TAR_LZ4.md`](FORMAT_TAR_LZ4.md)  
+**Impl:** `src/archive/tar_lz4/` (+ shared `tar_common`)
+
+Same tar + `RATAIDX1` as tar.zst (including **directory members**, **symlinks**, and **hard links**), but **independent LZ4 frames** + cleartext `RATLFRM1` frame table (no zeekstd equivalent for LZ4).
+
+| Requirement | Detail |
+|-------------|--------|
+| Format | Multi-frame LZ4 (`lz4_flex`) + `RATLFRM1` footer |
+| Payload | ustar/pax tar + EOA + `RATAIDX1` (same as tar.zst) |
+| Use case | Fast RA-friendly tar-class archive; list/extract without full solid scan |
+| Note | Distinct from per-file LZ4 in non-solid 7z (`--method lz4`) |
+
+**System-tar create interop (done):** e2e soft-probe uses `decompress_tar_lz4_payload_to_tar_bytes` (all frames, stop before `RATLFRM1`) then `tar -tf`; stock `lz4 -d` whole-file is not the interop path. See [`FORMAT_TAR_LZ4.md`](FORMAT_TAR_LZ4.md) Interop.
+
 ---
 
 ## Threading (archiveconverter parity)

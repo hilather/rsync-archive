@@ -135,7 +135,11 @@ jobs:
           body: |
             ## rsync-archive ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
 
-            First multi-distro release builds (x86_64, default features).
+            Multi-distro release builds (x86_64, default features).
+
+            ### Highlights
+            - RA-friendly **tar-zstd** / **tar-lz4** create formats (ustar/pax meta: mode, uid/gid, uname/gname; dirs, symlinks, hard links)
+            - Existing non-solid 7z create/embed and seekable-zstd unchanged as defaults
 
             ### Supported CI targets
             | Distro | Versions |

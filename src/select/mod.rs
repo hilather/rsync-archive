@@ -27,7 +27,8 @@ pub use from_file::{
 };
 pub use rules::{parse_rule, Rule, RuleAction, RuleSet};
 pub use walk::{
-    collect_from_files_from, collect_from_sources, SelectedEntry, SelectionStats,
+    collect_from_files_from, collect_from_sources, meta_owner_mode, names_for_uid_gid,
+    MemberKind, SelectedEntry, SelectionStats, DEFAULT_FILE_MODE, USTAR_NAME_FIELD,
 };
 
 use crate::error::{Error, Result};

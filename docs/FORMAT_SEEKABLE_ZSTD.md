@@ -104,7 +104,8 @@ There is no full `rsync-archive extract` subcommand yet; helpers are for verify 
 
 - Tar / pax compatibility of the inner payload
 - Solid 7z or 7z-with-zstd mixed containers
-- Directory entries, symlinks, ownership (same as 7z create: regular files only)
+- Directory entries, ownership (regular files only; same as 7z create)
+- Symlinks and hard-link members are selected at walk but **skipped** for this format (`skipped_symlinks` / `skipped_hardlinks`); the first regular-file body for a hard-linked inode is kept. Use **tar-zstd** / **tar-lz4** to archive link members
 - Parallel multi-file encode workers (single streaming encoder)
 
 ---

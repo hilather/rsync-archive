@@ -124,11 +124,19 @@ impl NonsolidLzma2Writer {
                 .ok()
                 .map(|d| d.as_secs())
         });
+        let (mode, uid, gid) = crate::select::meta_owner_mode(&meta);
+        let (uname, gname) = crate::select::names_for_uid_gid(uid, gid);
         let entry = SelectedEntry {
             abs_path: src.to_path_buf(),
             archive_name: name,
             size: meta.len(),
             mtime_unix,
+            mode,
+            uid,
+            gid,
+            uname,
+            gname,
+            kind: crate::select::MemberKind::File,
         };
         self.push_entry(&entry)
     }

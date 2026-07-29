@@ -41,6 +41,12 @@ pub enum OutputFormat {
     /// Single seekable-zstd stream with member index (byte-range access).
     #[value(name = "seekable-zstd", alias = "zst")]
     SeekableZstd,
+    /// Valid tar payload in seekable Zstd + RATARIDX1 member index (RA-friendly).
+    #[value(name = "tar-zstd", alias = "tar.zst", alias = "tarzst")]
+    TarZstd,
+    /// Valid tar payload in multi-frame LZ4 + RATLFRM1 frame table + RATAIDX1 (RA-friendly).
+    #[value(name = "tar-lz4", alias = "tar.lz4", alias = "tarlz4")]
+    TarLz4,
 }
 
 impl OutputFormat {
@@ -48,6 +54,8 @@ impl OutputFormat {
         match self {
             OutputFormat::SevenZ => "7z",
             OutputFormat::SeekableZstd => "seekable-zstd",
+            OutputFormat::TarZstd => "tar-zstd",
+            OutputFormat::TarLz4 => "tar-lz4",
         }
     }
 }
@@ -55,12 +63,14 @@ impl OutputFormat {
 /// Arguments for `rsync-archive create`.
 #[derive(Debug, Parser)]
 pub struct CreateArgs {
-    /// Output archive path (`.7z` or `.zst`).
+    /// Output archive path (`.7z`, `.zst`, `.tar.zst`, `.tzst`, `.tar.lz4`, `.tlz4`).
     #[arg(short = 'o', long = "output", value_name = "OUT")]
     pub output: PathBuf,
 
-    /// Output format: `7z` (default) or `seekable-zstd`.
-    /// If omitted, inferred from `-o` extension (`.zst` → seekable-zstd; else 7z).
+    /// Output format: `7z` (default), `seekable-zstd`, `tar-zstd`, or `tar-lz4`.
+    /// If omitted, inferred from `-o` extension
+    /// (`.tar.zst`/`.tzst` → tar-zstd; `.tar.lz4`/`.tlz4` → tar-lz4;
+    /// bare `.zst` → seekable-zstd; else 7z).
     #[arg(
         long = "format",
         visible_alias = "output-format",
@@ -108,7 +118,8 @@ pub struct CreateArgs {
 
     /// Compression method for **7z** format only: `lzma2` (default), `zstd`, or `lz4`.
     /// All produce **non-solid** per-file packs (file-level random access).
-    /// Not used with `--format seekable-zstd` (error if set to a non-default value).
+    /// Not used with `--format seekable-zstd` / `tar-zstd` / `tar-lz4`
+    /// (error if set to a non-default value).
     #[arg(long = "method", default_value = "lzma2")]
     pub method: String,
 
@@ -240,13 +251,17 @@ impl CreateArgs {
         }
 
         let format = self.resolved_format();
-        if format == OutputFormat::SeekableZstd {
+        if matches!(
+            format,
+            OutputFormat::SeekableZstd | OutputFormat::TarZstd | OutputFormat::TarLz4
+        ) {
             // `--method` defaults to lzma2; only reject non-default values so
-            // seekable-zstd can be used without forcing users to omit --method.
+            // non-7z formats can be used without forcing users to omit --method.
             if self.method != "lzma2" {
                 return Err(format!(
-                    "--method is for 7z format only (got --method {}); omit --method with --format seekable-zstd",
-                    self.method
+                    "--method is for 7z format only (got --method {}); omit --method with --format {}",
+                    self.method,
+                    format.as_str()
                 ));
             }
         }
@@ -255,7 +270,9 @@ impl CreateArgs {
 
     /// Resolve output format: explicit `--format`, else infer from `-o` extension.
     ///
-    /// - `.zst` → seekable-zstd
+    /// - `.tar.zst` / `.tzst` → tar-zstd
+    /// - `.tar.lz4` / `.tlz4` → tar-lz4
+    /// - bare `.zst` → seekable-zstd
     /// - otherwise → 7z (including `.7z` and extensionless paths)
     pub fn resolved_format(&self) -> OutputFormat {
         if let Some(f) = self.format {
@@ -267,10 +284,17 @@ impl CreateArgs {
 
 /// Infer create output format from the output path extension.
 pub fn infer_format_from_path(path: &Path) -> OutputFormat {
+    let s = path.to_string_lossy().to_ascii_lowercase();
+    if s.ends_with(".tar.zst") || s.ends_with(".tzst") {
+        return OutputFormat::TarZstd;
+    }
+    if s.ends_with(".tar.lz4") || s.ends_with(".tlz4") {
+        return OutputFormat::TarLz4;
+    }
     match path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|s| s.to_ascii_lowercase())
+        .map(|e| e.to_ascii_lowercase())
         .as_deref()
     {
         Some("zst") => OutputFormat::SeekableZstd,
@@ -291,6 +315,22 @@ mod tests {
         assert_eq!(
             infer_format_from_path(Path::new("out.ZST")),
             OutputFormat::SeekableZstd
+        );
+        assert_eq!(
+            infer_format_from_path(Path::new("out.tar.zst")),
+            OutputFormat::TarZstd
+        );
+        assert_eq!(
+            infer_format_from_path(Path::new("out.tzst")),
+            OutputFormat::TarZstd
+        );
+        assert_eq!(
+            infer_format_from_path(Path::new("out.tar.lz4")),
+            OutputFormat::TarLz4
+        );
+        assert_eq!(
+            infer_format_from_path(Path::new("out.tlz4")),
+            OutputFormat::TarLz4
         );
         assert_eq!(
             infer_format_from_path(Path::new("out.7z")),

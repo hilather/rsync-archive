@@ -50,6 +50,84 @@ fn create_tree_extract_matches() {
     assert!(!names.iter().any(|n| n.contains("skip.tmp")), "{names:?}");
 }
 
+#[cfg(unix)]
+#[test]
+fn create_7z_skips_symlinks_keeps_files() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("tree");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("a.txt"), b"keep-me").unwrap();
+    std::os::unix::fs::symlink("a.txt", root.join("link.txt")).unwrap();
+
+    let out = dir.path().join("out.7z");
+    bin()
+        .args([
+            "create",
+            "-o",
+            out.to_str().unwrap(),
+            "--level",
+            "1",
+            "--verify",
+            &format!("{}/", root.display()),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("symlinks skipped").or(predicate::str::contains("1 selected")));
+
+    let mut reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+    assert_eq!(reader.read_file("a.txt").unwrap(), b"keep-me");
+    let names: Vec<_> = reader
+        .archive()
+        .files
+        .iter()
+        .filter(|e| !e.is_directory())
+        .map(|e| e.name().to_string())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.contains("link.txt")),
+        "symlink must not be a 7z member: {names:?}"
+    );
+}
+
+/// Hard-linked files: 7z keeps only the first regular-file body; second path is skipped.
+#[cfg(unix)]
+#[test]
+fn create_7z_hardlinks_content_once() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("tree");
+    fs::create_dir_all(&root).unwrap();
+    let a = root.join("a.txt");
+    let b = root.join("b.txt");
+    fs::write(&a, b"once-only").unwrap();
+    fs::hard_link(&a, &b).unwrap();
+
+    let out = dir.path().join("out.7z");
+    bin()
+        .args([
+            "create",
+            "-o",
+            out.to_str().unwrap(),
+            "--level",
+            "1",
+            "--verify",
+            &format!("{}/", root.display()),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("hardlinks skipped"));
+
+    let mut reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+    let names: Vec<_> = reader
+        .archive()
+        .files
+        .iter()
+        .filter(|e| !e.is_directory())
+        .map(|e| e.name().to_string())
+        .collect();
+    assert_eq!(names.len(), 1, "expected single file member, got {names:?}");
+    assert_eq!(reader.read_file(&names[0]).unwrap(), b"once-only");
+}
+
 #[test]
 fn create_force_overwrite() {
     let dir = tempdir().unwrap();

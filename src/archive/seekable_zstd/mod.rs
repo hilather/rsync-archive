@@ -445,6 +445,12 @@ mod tests {
             archive_name: rel.replace('\\', "/"),
             size: data.len() as u64,
             mtime_unix: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            uname: String::new(),
+            gname: String::new(),
+            kind: crate::select::MemberKind::File,
         }
     }
 

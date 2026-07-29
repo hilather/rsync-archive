@@ -40,7 +40,9 @@ fn create_help_shows_key_flags() {
         .stdout(predicate::str::contains("--newer-than"))
         .stdout(predicate::str::contains("--method"))
         .stdout(predicate::str::contains("--format"))
-        .stdout(predicate::str::contains("seekable-zstd"));
+        .stdout(predicate::str::contains("seekable-zstd"))
+        .stdout(predicate::str::contains("tar-zstd"))
+        .stdout(predicate::str::contains("tar-lz4"));
 }
 
 #[test]

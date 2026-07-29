@@ -19,7 +19,7 @@
 
 | Command | Role |
 |---------|------|
-| **`create`** | Rsync-style include/exclude / files-from → **stream-read** sources → **stream-compress** → **non-solid** `.7z` (default) or **seekable-zstd** `.zst` |
+| **`create`** | Rsync-style include/exclude / files-from → **stream-read** sources → **stream-compress** → **non-solid** `.7z` (default), **seekable-zstd**, **tar.zst**, or **tar.lz4** |
 | **`embed`** | Take multiple finished files (typically `.7z`) → master/outer **non-solid store** 7z (Copy / method `0x00`), same idea as [archiveconverter](https://github.com/hilather/archiveconverter) outer append |
 
 **Create compresses; embed only stores.** Embed does **not** convert solid→non-solid (use archiveconverter for that).
@@ -30,7 +30,7 @@
 - **Disk-friendly:** no full tree copy to temp; stream read / stream compress / append packs.
 - **Rsync-style selection** for targeting, with `--dry-run` for testing filters.
 - **Safe output:** error if `-o` exists unless `--force`; write `OUT.partial` then rename (when pipelines land).
-- **Formats:** default **7z** non-solid; optional **seekable-zstd** for byte-range streams ([`docs/FORMAT_SEEKABLE_ZSTD.md`](docs/FORMAT_SEEKABLE_ZSTD.md)).
+- **Formats:** default **7z** non-solid; optional **seekable-zstd**, **tar-zstd**, **tar-lz4** for RA-friendly streams ([`docs/FORMAT_SEEKABLE_ZSTD.md`](docs/FORMAT_SEEKABLE_ZSTD.md), [`docs/FORMAT_TAR_ZSTD.md`](docs/FORMAT_TAR_ZSTD.md), [`docs/FORMAT_TAR_LZ4.md`](docs/FORMAT_TAR_LZ4.md)).
 
 ---
 
@@ -62,6 +62,9 @@ cargo run -- create -o out.7z --files-from list.txt
 # create seekable-zstd stream (byte-range access; infer from .zst or --format):
 cargo run -- create -o out.zst --format seekable-zstd --level 5 ./src/
 cargo run -- create -o pack.zst --level 3 ./data/           # .zst → seekable-zstd
+# RA-friendly tar payloads:
+cargo run -- create -o out.tar.zst --format tar-zstd ./src/
+cargo run -- create -o out.tar.lz4 --format tar-lz4 ./src/  # .tar.lz4 / .tlz4
 
 # embed finished files under a master store 7z:
 cargo run -- embed -o master.7z --allow-any a.bin b.bin
@@ -96,7 +99,11 @@ rsync-archive create -o logs.7z --max-total-size 500M --max-files 1000 --max-siz
 Empty files use empty flags; mtime from source; `OUT.partial` → rename. Parallel encode: fixed worker pool + **500M** in-flight size budget.  
 Optional denser codecs: `cargo build --features native-codecs` (`liblzma` LZMA2 + `lz4-hc` for lz4 levels ≥3).
 
-**`--format seekable-zstd`:** single Zstd **seekable** stream (zeekstd) with length-prefixed members + trailer index for name → uncompressed offset. Infer from `-o *.zst` when `--format` omitted. `--method` is 7z-only (error if non-default with seekable-zstd). Layout: [`docs/FORMAT_SEEKABLE_ZSTD.md`](docs/FORMAT_SEEKABLE_ZSTD.md).
+**`--format seekable-zstd`:** single Zstd **seekable** stream (zeekstd) with length-prefixed members + trailer index for name → uncompressed offset. Infer from bare `-o *.zst` when `--format` omitted. `--method` is 7z-only. Layout: [`docs/FORMAT_SEEKABLE_ZSTD.md`](docs/FORMAT_SEEKABLE_ZSTD.md).
+
+**`--format tar-zstd`:** valid **ustar/pax tar** payload inside seekable Zstd + `RATAIDX1` member index (path/size/mtime/**mode/uid/gid**; **uname/gname** in tar headers; RA extract). Includes **parent directory members** (`typeflag='5'`, trailing `/`), **symbolic links** (`typeflag='2'`), and **hard links** (`typeflag='1'`, linkname = first archive path for the inode; Unix detection; size 0) from the selection walk. Infer from `-o *.tar.zst` or `*.tzst`. Same selection/restrictions as other formats (7z / seekable-zstd skip symlinks and hard-link members, keeping the first file body). Layout: [`docs/FORMAT_TAR_ZSTD.md`](docs/FORMAT_TAR_ZSTD.md).
+
+**`--format tar-lz4`:** same tar + `RATAIDX1` idea with **independent LZ4 frames** + cleartext `RATLFRM1` frame table (no standard seekable-LZ4); same metadata including uname/gname in headers, parent directory members, **symlinks**, and **hard links**. Infer from `-o *.tar.lz4` or `*.tlz4`. Layout: [`docs/FORMAT_TAR_LZ4.md`](docs/FORMAT_TAR_LZ4.md).
 
 Default create remains **non-solid 7z** with **`--method lzma2`**.
 
@@ -133,7 +140,7 @@ Default naming flattens to **basename**. Missing 7z magic **warns** (stderr log)
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `-o`, `--output` | required | Output path (`.7z` or `.zst`) |
-| `--format` / `--output-format` | infer / `7z` | `7z` · `seekable-zstd` (`.zst` extension → seekable-zstd) |
+| `--format` / `--output-format` | infer / `7z` | `7z` · `seekable-zstd` (`.zst`) · `tar-zstd` (`.tar.zst` / `.tzst`) · `tar-lz4` (`.tar.lz4` / `.tlz4`) |
 | `-n`, `--dry-run` | off | List selection only |
 | `--force` | off | Overwrite existing `-o` |
 | `--exclude` / `--include` | — | Rsync-style patterns (repeatable) |
@@ -142,7 +149,7 @@ Default naming flattens to **basename**. Missing 7z magic **warns** (stderr log)
 | `--filter` | — | `+ pattern` / `- pattern` (repeatable) |
 | `--level` | `5` | Level 0–9 (LZMA2 preset / mapped Zstd; LZ4 1–2 fast, ≥3 HC with `--features lz4-hc`) |
 | `--method` | `lzma2` | **7z only:** `lzma2` · `zstd` · `lz4` (non-solid per-file packs) |
-| `--verify` | off | Post-write: non-solid + member count + sample extract (7z); index check (seekable-zstd) |
+| `--verify` | off | Post-write: non-solid + member count + sample extract (7z); index/member check (seekable-zstd / tar-zstd / tar-lz4) |
 | `--threads` | auto | **7z only:** encode workers (omit = auto: many tiny files → 1, else CPUs) |
 | `--encode-concurrency` | `0` | **7z only:** max concurrent encodes (`0` = auto from threads) |
 | `--encode-size-budget` | `500M` | **7z only:** max in-flight uncompressed size (`0` = unlimited) |
@@ -192,6 +199,8 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for stages and PR plan.
 | 8 Parallel encode (AC-style threads) | **Done** — worker pool + ordered streaming write; `--threads` / `--encode-concurrency` / `--encode-size-budget 500M` |
 | Codec: Zstd + LZ4 in 7z | **Done** — `--method zstd|lz4` (file-level RA); optional `--features native-codecs` |
 | True seekable-zstd stream (zeekstd) | **Done** — `--format seekable-zstd` / `-o *.zst` ([`docs/FORMAT_SEEKABLE_ZSTD.md`](docs/FORMAT_SEEKABLE_ZSTD.md)) |
+| RA-friendly tar.zst | **Done** — `--format tar-zstd` / `*.tar.zst` / `*.tzst` ([`docs/FORMAT_TAR_ZSTD.md`](docs/FORMAT_TAR_ZSTD.md)) |
+| RA-friendly tar.lz4 | **Done** — `--format tar-lz4` / `*.tar.lz4` / `*.tlz4` ([`docs/FORMAT_TAR_LZ4.md`](docs/FORMAT_TAR_LZ4.md)) |
 | 9 Directory size budgets (newest-first) | **Done** — `--dir-max-size PATH=SIZE` (recursive; longest prefix) |
 | Directory file-count limits (newest-first) | **Done** — `--dir-max-files PATH=N` / from-file (**recursive** tree scope) |
 | Global log-collection limits | **Done** — `--max-total-size` / `--max-files` / `--max-size` / `--min-size` / `--newer-than` |
@@ -205,15 +214,20 @@ src/
   main.rs, cli.rs, lib.rs, error.rs
   archive/sevenz/         # non-solid header + store + create writers
   archive/seekable_zstd/  # seekable-zstd create + list/extract helpers
+  archive/tar_zstd/       # RA tar.zst (seekable Zstd + RATAIDX1)
+  archive/tar_lz4/        # RA tar.lz4 (multi-frame LZ4 + RATLFRM1 + RATAIDX1)
+  archive/tar_common.rs   # shared ustar/pax + RATAIDX1 helpers
   select/                 # SourceSpec, pathnorm, rules, matcher, from_file, walk, dir_budget, global_restrict
   pipeline/output.rs      # partial path, --force check, rename helpers
-  pipeline/create.rs      # create selection + 7z / seekable-zstd write
+  pipeline/create.rs      # create selection + 7z / seekable-zstd / tar.* write
   pipeline/embed.rs       # embed command (store outer)
   util/                   # tracing init
 docs/
   DESIGN.md               # full design
   SELECTION.md            # filter semantics (Stage 4, frozen v1)
   FORMAT_SEEKABLE_ZSTD.md # seekable-zstd on-disk layout
+  FORMAT_TAR_ZSTD.md      # tar.zst layout
+  FORMAT_TAR_LZ4.md       # tar.lz4 layout
 AGENTS.md                 # mandatory agent policy (docs + tests)
 .grok/skills/
   keep-docs-current/
@@ -259,8 +273,8 @@ Docs: [`docs/BENCH.md`](docs/BENCH.md) · published numbers: [`docs/bench/RESULT
 
 ```bash
 # Cut a release (maintainers)
-git tag -a v0.1.0 -m "v0.1.0"
-git push origin v0.1.0
+git tag -a v0.2.0 -m "v0.2.0"
+git push origin v0.2.0
 ```
 
 Rocky builds run in official `rockylinux/rockylinux` containers. Ubuntu uses GitHub-hosted runners.

@@ -11,7 +11,7 @@
 use crate::archive::sevenz::{
     compress_path_with_size, filetime_from_unix_secs, CompressedPack, CompressMethod,
 };
-use crate::archive::{write_seekable_zstd, NonsolidLzma2Writer};
+use crate::archive::{write_seekable_zstd, write_tar_lz4, write_tar_zstd, NonsolidLzma2Writer};
 use crate::cli::{CreateArgs, OutputFormat};
 use crate::error::{Error, Result};
 use crate::pipeline::output::{cleanup_partial, commit_output, prepare_output};
@@ -24,7 +24,7 @@ use crate::select::global_restrict::{
     apply_max_files, apply_max_total_size, apply_per_file_limits, per_file_limits_from_cli,
 };
 use crate::select::walk::{
-    collect_from_files_from, collect_from_sources, SelectedEntry, SelectionStats,
+    collect_from_files_from, collect_from_sources, MemberKind, SelectedEntry, SelectionStats,
 };
 use crate::select::{RuleSet, SourceSpec};
 use crate::util::{
@@ -38,7 +38,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Build the ordered filter set from create CLI flags.
 ///
@@ -128,13 +128,61 @@ pub fn build_selection(
     Ok((entries, stats, report))
 }
 
+/// Drop link members for formats that only pack regular files (7z, seekable-zstd).
+///
+/// Tar formats keep symlinks and hard-link members. Updates
+/// `stats.skipped_symlinks` / `stats.skipped_hardlinks` and `stats.selected`.
+/// The first regular-file copy of a hard-linked inode is kept as
+/// [`MemberKind::File`]; subsequent hard-link members are dropped here.
+fn filter_entries_for_format(
+    format: OutputFormat,
+    entries: Vec<SelectedEntry>,
+    stats: &mut SelectionStats,
+) -> Vec<SelectedEntry> {
+    match format {
+        OutputFormat::TarZstd | OutputFormat::TarLz4 => entries,
+        OutputFormat::SevenZ | OutputFormat::SeekableZstd => {
+            let mut kept = Vec::with_capacity(entries.len());
+            for e in entries {
+                match e.kind {
+                    MemberKind::File => kept.push(e),
+                    MemberKind::Symlink { .. } => {
+                        stats.skipped_symlinks += 1;
+                        debug!(
+                            name = %e.archive_name,
+                            format = format.as_str(),
+                            "skip symlink for non-tar format"
+                        );
+                    }
+                    MemberKind::HardLink { .. } => {
+                        stats.skipped_hardlinks += 1;
+                        debug!(
+                            name = %e.archive_name,
+                            format = format.as_str(),
+                            "skip hard link for non-tar format"
+                        );
+                    }
+                }
+            }
+            stats.selected = kept.len() as u64;
+            kept
+        }
+    }
+}
+
 /// Run `rsync-archive create`.
 ///
 /// Dry-run lists archive names and exit 0 even when empty.
-/// Write builds a non-solid 7z or seekable-zstd stream via partial+rename.
+/// Write builds a non-solid 7z, seekable-zstd, tar.zst, or tar.lz4 stream via partial+rename.
+///
+/// Symlinks and hard links are selected at walk time; **tar-zstd** / **tar-lz4**
+/// archive them as typeflag `'2'` / `'1'` members; **7z** / **seekable-zstd**
+/// skip them (counted in `skipped_symlinks` / `skipped_hardlinks`), keeping only
+/// the first regular-file body for each hard-linked inode.
 pub fn run_create(args: CreateArgs) -> Result<()> {
     let format = args.resolved_format();
-    let (entries, stats, restrictions) = build_selection(&args)?;
+    let (entries, mut stats, restrictions) = build_selection(&args)?;
+    let entries = filter_entries_for_format(format, entries, &mut stats);
 
     if args.dry_run {
         for e in &entries {
@@ -154,6 +202,7 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
             skipped_max_total_size = stats.skipped_max_total_size,
             skipped_max_files = stats.skipped_max_files,
             skipped_symlinks = stats.skipped_symlinks,
+            skipped_hardlinks = stats.skipped_hardlinks,
             skipped_special = stats.skipped_special,
             "create dry-run complete"
         );
@@ -172,6 +221,8 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
         OutputFormat::SeekableZstd => {
             run_create_seekable_zstd(&args, &entries, &stats, &restrictions)
         }
+        OutputFormat::TarZstd => run_create_tar_zstd(&args, &entries, &stats, &restrictions),
+        OutputFormat::TarLz4 => run_create_tar_lz4(&args, &entries, &stats, &restrictions),
     }
 }
 
@@ -278,6 +329,100 @@ fn run_create_sevenz(
 
 fn timings_enabled() -> bool {
     std::env::var_os("RSYNC_ARCHIVE_TIMINGS").is_some()
+}
+
+fn run_create_tar_zstd(
+    args: &CreateArgs,
+    entries: &[SelectedEntry],
+    stats: &SelectionStats,
+    restrictions: &RestrictionReport,
+) -> Result<()> {
+    info!(
+        format = "tar-zstd",
+        level = args.level,
+        file_count = entries.len(),
+        "create tar.zst"
+    );
+
+    let paths = prepare_output(&args.output, args.force)?;
+    match write_tar_zstd(&paths.partial_path, entries, args.level) {
+        Ok(()) => {
+            commit_output(&paths)?;
+            restrictions.eprint_compact();
+            print_selection_summary(stats, false);
+            let member_count =
+                crate::archive::tar_common::expected_tar_member_count(entries);
+            info!(
+                path = %paths.final_path.display(),
+                file_count = entries.len(),
+                member_count,
+                level = args.level,
+                "create tar.zst complete"
+            );
+            eprintln!(
+                "created {member_count} member(s) ({} file(s)) → {} (format tar-zstd, level {})",
+                entries.len(),
+                paths.final_path.display(),
+                args.level
+            );
+            if args.verify {
+                crate::archive::verify_tar_zstd(&paths.final_path, member_count)?;
+                eprintln!("verify ok: {member_count} member(s), tar-zstd");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            cleanup_partial(&paths);
+            Err(e)
+        }
+    }
+}
+
+fn run_create_tar_lz4(
+    args: &CreateArgs,
+    entries: &[SelectedEntry],
+    stats: &SelectionStats,
+    restrictions: &RestrictionReport,
+) -> Result<()> {
+    info!(
+        format = "tar-lz4",
+        level = args.level,
+        file_count = entries.len(),
+        "create tar.lz4"
+    );
+
+    let paths = prepare_output(&args.output, args.force)?;
+    match write_tar_lz4(&paths.partial_path, entries, args.level) {
+        Ok(()) => {
+            commit_output(&paths)?;
+            restrictions.eprint_compact();
+            print_selection_summary(stats, false);
+            let member_count =
+                crate::archive::tar_common::expected_tar_member_count(entries);
+            info!(
+                path = %paths.final_path.display(),
+                file_count = entries.len(),
+                member_count,
+                level = args.level,
+                "create tar.lz4 complete"
+            );
+            eprintln!(
+                "created {member_count} member(s) ({} file(s)) → {} (format tar-lz4, level {})",
+                entries.len(),
+                paths.final_path.display(),
+                args.level
+            );
+            if args.verify {
+                crate::archive::verify_tar_lz4(&paths.final_path, member_count)?;
+                eprintln!("verify ok: {member_count} member(s), tar-lz4");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            cleanup_partial(&paths);
+            Err(e)
+        }
+    }
 }
 
 fn run_create_seekable_zstd(
@@ -619,7 +764,7 @@ fn verify_create_archive(path: &Path, expected_files: usize) -> Result<()> {
 fn print_selection_summary(stats: &SelectionStats, dry_run: bool) {
     let mode = if dry_run { "dry-run" } else { "create" };
     eprintln!(
-        "{mode}: {} selected, {} excluded, {} dir-budget skipped, {} dir-file-limit skipped, {} max-size skipped, {} min-size skipped, {} older-than skipped, {} max-total-size skipped, {} max-files skipped, {} symlinks skipped, {} special skipped",
+        "{mode}: {} selected, {} excluded, {} dir-budget skipped, {} dir-file-limit skipped, {} max-size skipped, {} min-size skipped, {} older-than skipped, {} max-total-size skipped, {} max-files skipped, {} symlinks skipped, {} hardlinks skipped, {} special skipped",
         stats.selected,
         stats.skipped_excluded,
         stats.skipped_dir_budget,
@@ -630,6 +775,7 @@ fn print_selection_summary(stats: &SelectionStats, dry_run: bool) {
         stats.skipped_max_total_size,
         stats.skipped_max_files,
         stats.skipped_symlinks,
+        stats.skipped_hardlinks,
         stats.skipped_special
     );
 }

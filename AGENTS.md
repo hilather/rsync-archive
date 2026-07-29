@@ -106,7 +106,8 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | Overwrite | **Error** if `-o` exists unless `--force` |
 | Atomic write | `OUT.partial` → rename after successful finish |
 | Empty write | **Error** (dry-run of empty selection may exit 0 with message) |
-| Symlinks / special files | **Skip** with warning (regular files only) |
+| Symlinks | **tar-zstd / tar-lz4:** archived as typeflag `'2'` (linkname; size 0). **7z / seekable-zstd:** skipped (counted). Special files always skipped. |
+| Hard links | **Unix:** first `(dev,ino)` path is full file; later → `HardLink` (size 0). **tar-zstd / tar-lz4:** typeflag `'1'` (linkname = first archive path). **7z / seekable-zstd:** skip hard-link members (keep first file). Non-Unix: no detection. |
 | `--files-from` | Exclusive of `SRC...`; paths relative to **CWD** unless absolute |
 | Patterns without `/` | Match **basename** (e.g. `*.tmp` matches `dir/a.tmp`) |
 | Streaming | Peak RAM O(dict + I/O buffers), not O(file size) for create |
@@ -133,6 +134,9 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | `src/archive/sevenz/lzma2_writer.rs` | `NonsolidLzma2Writer` — non-solid create packs (all methods) |
 | `src/archive/sevenz/codec.rs` | LZMA2 / Zstd / LZ4 encode; optional `liblzma` + `lz4-hc` features |
 | `src/archive/seekable_zstd/` | Seekable-zstd create + member index list/extract |
+| `src/archive/tar_common.rs` | Shared ustar/pax headers + RATAIDX1 index encode/parse |
+| `src/archive/tar_zstd/` | RA-friendly tar.zst (ustar/pax + seekable Zstd + RATAIDX1) |
+| `src/archive/tar_lz4/` | RA-friendly tar.lz4 (ustar/pax + multi-frame LZ4 + RATLFRM1 + RATAIDX1) |
 | `src/util/` | Tracing init (`-v` / `-vv`) |
 | `src/archive/mod.rs` | Archive module root; re-exports store + seekable-zstd API |
 | `src/archive/sevenz/header.rs` | `HeaderFile`, `write_raw_header`, `write_start_header`, empty bits, names, mtime, attrs |
