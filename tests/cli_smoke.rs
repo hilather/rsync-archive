@@ -14,7 +14,26 @@ fn help_lists_create_and_embed() {
         .assert()
         .success()
         .stdout(predicate::str::contains("create"))
-        .stdout(predicate::str::contains("embed"));
+        .stdout(predicate::str::contains("embed"))
+        .stdout(predicate::str::contains("Examples:"))
+        .stdout(predicate::str::contains("tar-zstd").or(predicate::str::contains("non-solid")));
+}
+
+#[test]
+fn short_help_h_shows_guidance() {
+    // `-h` is the short surface; must still list formats and key flags.
+    bin()
+        .args(["create", "-h"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--format"))
+        .stdout(predicate::str::contains("tar-zstd"))
+        .stdout(predicate::str::contains("tar-lz4"))
+        .stdout(predicate::str::contains("seekable-zstd"))
+        .stdout(predicate::str::contains("--method"))
+        .stdout(predicate::str::contains("--dir-max-size"))
+        .stdout(predicate::str::contains("recursive"))
+        .stdout(predicate::str::contains("Examples:"));
 }
 
 #[test]
@@ -31,8 +50,10 @@ fn create_help_shows_key_flags() {
         .stdout(predicate::str::contains("--threads"))
         .stdout(predicate::str::contains("--encode-size-budget"))
         .stdout(predicate::str::contains("--dir-max-size"))
+        .stdout(predicate::str::contains("--dir-max-size-from"))
         .stdout(predicate::str::contains("--dir-max-files"))
         .stdout(predicate::str::contains("--dir-max-files-from"))
+        .stdout(predicate::str::contains("--file-size-from"))
         .stdout(predicate::str::contains("--max-total-size"))
         .stdout(predicate::str::contains("--max-files"))
         .stdout(predicate::str::contains("--max-size"))
@@ -42,20 +63,23 @@ fn create_help_shows_key_flags() {
         .stdout(predicate::str::contains("--format"))
         .stdout(predicate::str::contains("seekable-zstd"))
         .stdout(predicate::str::contains("tar-zstd"))
-        .stdout(predicate::str::contains("tar-lz4"));
+        .stdout(predicate::str::contains("tar-lz4"))
+        .stdout(predicate::str::contains("Examples:"))
+        .stdout(predicate::str::contains("SELECTION.md").or(predicate::str::contains("rsync-style")));
 }
 
 #[test]
 fn embed_help_shows_key_flags() {
     bin()
-        .args(["embed", "--help"])
+        .args(["embed", "-h"])
         .assert()
         .success()
         .stdout(predicate::str::contains("--dry-run"))
         .stdout(predicate::str::contains("--force"))
         .stdout(predicate::str::contains("--keep-path"))
         .stdout(predicate::str::contains("--require-7z"))
-        .stdout(predicate::str::contains("--allow-any"));
+        .stdout(predicate::str::contains("--allow-any"))
+        .stdout(predicate::str::contains("Examples:"));
 }
 
 #[test]
@@ -188,8 +212,10 @@ fn create_validate_unit_rejects_both_modes() {
         encode_concurrency: 0,
         encode_size_budget: "500M".into(),
         dir_max_size: vec![],
+        dir_max_size_from: None,
         dir_max_files: vec![],
         dir_max_files_from: None,
+        file_size_from: None,
         max_total_size: None,
         max_files: None,
         max_size: None,
@@ -223,8 +249,10 @@ fn create_validate_unit_accepts_sources_only() {
         encode_concurrency: 0,
         encode_size_budget: "500M".into(),
         dir_max_size: vec![],
+        dir_max_size_from: None,
         dir_max_files: vec![],
         dir_max_files_from: None,
+        file_size_from: None,
         max_total_size: None,
         max_files: None,
         max_size: None,

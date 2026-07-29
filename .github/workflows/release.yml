@@ -138,7 +138,8 @@ jobs:
             Multi-distro release builds (x86_64, default features).
 
             ### Highlights
-            - RA-friendly **tar-zstd** / **tar-lz4** create formats (ustar/pax meta: mode, uid/gid, uname/gname; dirs, symlinks, hard links)
+            - RA-friendly **tar-zstd** / **tar-lz4** create formats (ustar/pax meta; dirs, symlinks, hard links)
+            - Restriction list files: **`--file-size-from`**, **`--dir-max-size-from`** (plus improved CLI help)
             - Existing non-solid 7z create/embed and seekable-zstd unchanged as defaults
 
             ### Supported CI targets

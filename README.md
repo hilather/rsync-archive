@@ -85,6 +85,7 @@ rsync-archive create -o out.7z --files-from list.txt --dry-run
 rsync-archive create -o out.7z --force --level 1 /data/tree
 rsync-archive create -o o.7z --dir-max-size logs/=100M --dir-max-size cache=50M tree/
 rsync-archive create -o o.7z --dir-max-files logs/=10 --dir-max-files-from limits.txt tree/
+rsync-archive create -o o.7z --files-from master.txt --file-size-from sizes.txt --dir-max-size-from dirs.txt
 rsync-archive create -o logs.7z --max-total-size 500M --max-files 1000 --max-size 50M --newer-than 7d /var/log/
 ```
 
@@ -110,9 +111,13 @@ Default create remains **non-solid 7z** with **`--method lzma2`**.
 **Trailing `/` on SRC** strips the directory name from archive paths (`photos/` → `a.jpg`; `photos` → `photos/a.jpg`).  
 **`--files-from`:** exclusive of `SRC...`; relative lines keep path as member name; absolute lines use basename.  
 **Filters:** see [`docs/SELECTION.md`](docs/SELECTION.md). Rule build order: include-from → exclude-from → `--filter` → `--include` → `--exclude` (use `--filter` for strict interleaving).  
-**`--dir-max-size PATH=SIZE`:** after filters (and per-file size/age), cap total selected bytes under an archive-relative directory (**recursive**; newest mtime first; nested → longest prefix).  
-**`--dir-max-files PATH=N`** / **`--dir-max-files-from`:** cap file count under a directory tree (**recursive**; newest mtime first; longest prefix wins).  
-**Global / log-collection caps** (after dir limits): `--max-total-size SIZE`, `--max-files N` (newest-first); per-file `--max-size` / `--min-size` / `--newer-than DURATION` (`7d`, `24h`, …) apply before dir budgets.
+**Restriction list files** (only matching paths/prefixes; others ignore that list):  
+- **`--file-size-from`:** rsync-like `PATTERN max=SIZE` (no min; first match wins).  
+- **`--dir-max-size-from`:** `DIR/ max=SIZE` and optional `files=N`, or legacy `DIR/=SIZE`.  
+- **`--dir-max-files-from`:** `PATH=N` or `PATH/ files=N`.  
+**`--dir-max-size PATH=SIZE`:** CLI form of dir byte budget (**recursive**; newest mtime first; longest prefix).  
+**`--dir-max-files PATH=N`:** CLI form of dir file-count cap (**recursive**).  
+**Global caps:** `--max-total-size` / `--max-files` (after dir limits); global `--max-size` / `--min-size` / `--newer-than` apply to all candidates when set.
 
 ### `embed` (Stage 3 — implemented)
 
@@ -145,7 +150,9 @@ Default naming flattens to **basename**. Missing 7z magic **warns** (stderr log)
 | `--force` | off | Overwrite existing `-o` |
 | `--exclude` / `--include` | — | Rsync-style patterns (repeatable) |
 | `--exclude-from` / `--include-from` | — | Pattern files |
-| `--files-from` | — | Explicit file list (exclusive of `SRC...`) |
+| `--files-from` | — | Master collect list (exclusive of `SRC...`) |
+| `--file-size-from` | — | Per-path max size list (`PATTERN max=SIZE`; only matches) |
+| `--dir-max-size-from` | — | Dir size/count list (`DIR/ max=SIZE [files=N]`) |
 | `--filter` | — | `+ pattern` / `- pattern` (repeatable) |
 | `--level` | `5` | Level 0–9 (LZMA2 preset / mapped Zstd; LZ4 1–2 fast, ≥3 HC with `--features lz4-hc`) |
 | `--method` | `lzma2` | **7z only:** `lzma2` · `zstd` · `lz4` (non-solid per-file packs) |
@@ -153,7 +160,7 @@ Default naming flattens to **basename**. Missing 7z magic **warns** (stderr log)
 | `--threads` | auto | **7z only:** encode workers (omit = auto: many tiny files → 1, else CPUs) |
 | `--encode-concurrency` | `0` | **7z only:** max concurrent encodes (`0` = auto from threads) |
 | `--encode-size-budget` | `500M` | **7z only:** max in-flight uncompressed size (`0` = unlimited) |
-| `--dir-max-size` | — | Cap selected bytes under archive-relative dir (`PATH=SIZE`, repeatable; recursive; newest-first) |
+| `--dir-max-size` | — | Cap selected bytes under archive-relative dir (`PATH=SIZE`, repeatable; listed dirs only) |
 | `--dir-max-files` | — | Cap file count under dir tree (`PATH=N`, recursive; newest-first; longest prefix) |
 | `--dir-max-files-from` | — | File of `PATH=N` lines (same as `--dir-max-files`) |
 | `--max-total-size` | — | Global selected-byte cap (newest-mtime-first fill) |
@@ -273,8 +280,8 @@ Docs: [`docs/BENCH.md`](docs/BENCH.md) · published numbers: [`docs/bench/RESULT
 
 ```bash
 # Cut a release (maintainers)
-git tag -a v0.2.0 -m "v0.2.0"
-git push origin v0.2.0
+git tag -a v0.3.0 -m "v0.3.0"
+git push origin v0.3.0
 ```
 
 Rocky builds run in official `rockylinux/rockylinux` containers. Ubuntu uses GitHub-hosted runners.

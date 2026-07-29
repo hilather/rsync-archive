@@ -4,9 +4,9 @@
 //!
 //! - **Size budgets** (`--dir-max-size`): recursive under `PATH/`; keep while
 //!   `running_sum + size <= limit`. Nested budgets: longest matching prefix wins.
-//! - **File-count limits** (`--dir-max-files`): **immediate children only** of
-//!   `PATH` (one path segment under the prefix; nested files are not counted).
-//!   Keep the `N` newest by mtime; further direct children are file-limit skips.
+//! - **File-count limits** (`--dir-max-files`): **recursive** under `PATH/`
+//!   (same tree model as size budgets). Keep the `N` newest by mtime; further
+//!   files under that prefix are file-limit skips. Nested: longest prefix wins.
 //!
 //! Both sort by mtime descending, then `archive_name` ascending.
 
@@ -69,8 +69,10 @@ pub struct GlobalCountCapOutcome {
 pub struct RestrictionReport {
     pub size_budgets: Vec<DirBudgetOutcome>,
     pub file_limits: Vec<DirFileLimitOutcome>,
-    /// Files skipped by `--max-size` (per-file).
+    /// Files skipped by `--max-size` (per-file, global).
     pub skipped_max_size: Vec<RestrictionFile>,
+    /// Files skipped by `--file-size-from` (pattern list; only matching paths).
+    pub skipped_file_size_from: Vec<RestrictionFile>,
     /// Files skipped by `--min-size` (per-file).
     pub skipped_min_size: Vec<RestrictionFile>,
     /// Files skipped by `--newer-than` (too old).
@@ -86,6 +88,7 @@ impl RestrictionReport {
         self.size_budgets.is_empty()
             && self.file_limits.is_empty()
             && self.skipped_max_size.is_empty()
+            && self.skipped_file_size_from.is_empty()
             && self.skipped_min_size.is_empty()
             && self.skipped_older_than.is_empty()
             && self.max_total_size.is_none()
@@ -108,6 +111,16 @@ impl RestrictionReport {
                 format_bytes_short(skip_b),
             );
             append_name_list(&mut out, "  skip", &self.skipped_max_size);
+        }
+        if !self.skipped_file_size_from.is_empty() {
+            let skip_b: u64 = self.skipped_file_size_from.iter().map(|f| f.size).sum();
+            let _ = writeln!(
+                out,
+                "file-size-from: skip {} ({})",
+                self.skipped_file_size_from.len(),
+                format_bytes_short(skip_b),
+            );
+            append_name_list(&mut out, "  skip", &self.skipped_file_size_from);
         }
         if !self.skipped_min_size.is_empty() {
             let skip_b: u64 = self.skipped_min_size.iter().map(|f| f.size).sum();
@@ -287,7 +300,7 @@ pub fn normalize_budget_prefix(path: &str) -> Result<String> {
     normalize_archive_str(trimmed)
 }
 
-/// One `--dir-max-files PATH=N` limit (immediate children only).
+/// One `--dir-max-files PATH=N` limit (recursive under PATH/).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirFileLimit {
     /// Archive-relative directory prefix (no trailing `/`).
@@ -344,7 +357,7 @@ pub fn parse_dir_file_limits(args: &[String]) -> Result<Vec<DirFileLimit>> {
     Ok(out)
 }
 
-/// Load `--dir-max-files-from FILE`: one `PATH=N` per non-comment line.
+/// Load `--dir-max-files-from FILE`: `PATH=N` or rsync-like `PATH/ files=N`.
 ///
 /// Blank lines and `#` comments are skipped. Duplicate prefixes (within the
 /// file or against `existing`) error.
@@ -352,27 +365,7 @@ pub fn load_dir_max_files_from(
     path: &Path,
     existing: &mut Vec<DirFileLimit>,
 ) -> Result<()> {
-    use super::from_file::read_capped_lines;
-    let lines = read_capped_lines(path)?;
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let lim = parse_dir_max_files_arg(trimmed).map_err(|e| {
-            Error::Selection(format!("{}:{}: {e}", path.display(), idx + 1))
-        })?;
-        if existing.iter().any(|x| x.prefix == lim.prefix) {
-            return Err(Error::Message(format!(
-                "{}:{}: duplicate --dir-max-files for directory '{}'",
-                path.display(),
-                idx + 1,
-                lim.prefix
-            )));
-        }
-        existing.push(lim);
-    }
-    Ok(())
+    super::restrict_lists::load_dir_max_files_from_ext(path, existing)
 }
 
 /// Merge CLI `--dir-max-files` args with optional `--dir-max-files-from`.
@@ -385,6 +378,21 @@ pub fn collect_dir_file_limits(
         load_dir_max_files_from(path, &mut limits)?;
     }
     Ok(limits)
+}
+
+/// Merge CLI `--dir-max-size` with optional `--dir-max-size-from`.
+///
+/// The list file may also contribute `files=N` entries into `file_limits`.
+pub fn collect_dir_budgets(
+    cli_args: &[String],
+    from_file: Option<&Path>,
+    file_limits: &mut Vec<DirFileLimit>,
+) -> Result<Vec<DirBudget>> {
+    let mut budgets = parse_dir_budgets(cli_args)?;
+    if let Some(path) = from_file {
+        super::restrict_lists::load_dir_max_size_from(path, &mut budgets, file_limits)?;
+    }
+    Ok(budgets)
 }
 
 /// Parse many CLI args into budgets; duplicate prefixes error.

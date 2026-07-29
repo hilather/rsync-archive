@@ -217,10 +217,12 @@ pub struct SelectionStats {
     /// Files dropped solely because a `--dir-max-size` budget was exhausted.
     pub skipped_dir_budget: u64,
     /// Files dropped solely because a `--dir-max-files` limit was exhausted
-    /// (immediate children only).
+    /// (recursive under the directory prefix).
     pub skipped_dir_file_limit: u64,
     /// Single-file size above `--max-size`.
     pub skipped_max_size: u64,
+    /// Skipped by `--file-size-from` pattern list (size above matching max=).
+    pub skipped_file_size_from: u64,
     /// Single-file size below `--min-size`.
     pub skipped_min_size: u64,
     /// File mtime older than `--newer-than` window.

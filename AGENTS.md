@@ -21,19 +21,50 @@ This file is **mandatory policy** for every coding agent session in this repo (G
 
 ---
 
+## Non-negotiable: CLI help is a first-class surface
+
+**`rsync-archive -h` / `create -h` / `embed -h` (and long `--help`) are user-facing docs.**  
+They must stay accurate and useful — not stale clap stubs.
+
+### Rules
+
+1. **Every new or changed flag, default, alias, format, or subcommand** must update **`src/cli.rs`** in the same change:
+   - `///` doc comments on the field/enum/variant (this is what clap prints)
+   - `about` / `long_about` / `after_help` on the command structs when the overall UX changes
+2. **Short help (`-h`) must be enough to use the tool.** Clap shows only the **first line** of multi-line `///` as short help. Put a complete one-line description first; put examples/details on following lines (shown by `--help`).
+3. After CLI edits, agents **must run and read**:
+   ```bash
+   cargo run --bin rsync-archive -- --help
+   cargo run --bin rsync-archive -- create -h
+   cargo run --bin rsync-archive -- create --help
+   cargo run --bin rsync-archive -- embed -h
+   ```
+   Confirm flags appear, defaults match code, and wording is not wrong (e.g. recursive vs direct-only).
+4. Update **`tests/cli_smoke.rs`** when adding user-visible flags so help regressions fail the suite.
+5. Still update **README** flag tables (help and README both required).
+
+### Anti-patterns
+
+- Shipping a flag with empty or placeholder help
+- Leaving `about` text that only mentions 7z when tar/seekable formats exist
+- Multi-line docs where the first line is vague (“Cap directory”) and the real semantics are only in long help
+- Forgetting `-h` vs `--help` (long help alone is not enough)
+
+---
+
 ## Non-negotiable: docs stay current
 
 **Every commit that changes user-visible behavior, CLI, defaults, or architecture must update documentation in the same change** (or the same PR before merge).
 
 | Change type | Update these |
 |-------------|----------------|
-| New/changed CLI flag or default | `README.md` flag tables + quick start; `src/cli.rs` help text |
+| New/changed CLI flag or default | **`src/cli.rs` help** + `README.md` flag tables + quick start + `tests/cli_smoke.rs` |
 | Selection / filter semantics | `README.md` + `docs/SELECTION.md` (when present) + tests |
-| Create/embed/streaming behavior | `README.md` architecture / status table |
+| Create/embed/streaming behavior | `README.md` architecture / status table; **create/embed `-h` about text** if roles change |
 | Module layout change | `README.md` project layout; this file’s project map |
 | Docs-only / comment-only | No extra churn required; fix anything you know is wrong |
 
-When removing or renaming a flag, grep README + AGENTS + skills and fix all hits.
+When removing or renaming a flag, grep README + AGENTS + skills + **`src/cli.rs`** and fix all hits.
 
 **Skill:** `.grok/skills/keep-docs-current/SKILL.md`  
 Run before commit when user-visible behavior or docs might be stale.
@@ -80,8 +111,9 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 1. Diff change set
 2. keep-tests-current  (if code/behavior)
 3. keep-docs-current   (if user-visible)
-4. cargo test
-5. Commit code + tests + docs together when practical
+4. If CLI changed: re-read create -h / embed -h / --help (see CLI policy above)
+5. cargo test
+6. Commit code + tests + docs + help text together when practical
 ```
 
 ---
@@ -90,17 +122,18 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 
 | Topic | Default / rule |
 |-------|----------------|
-| Create format | **Non-solid** 7z only |
+| Create format | Default **non-solid 7z**; also `seekable-zstd`, `tar-zstd`, `tar-lz4` |
 | Create compression | LZMA2 `0x21` for non-empty; empty via empty flags |
 | Compression level | **5** |
 | Create method | **lzma2** default; also `zstd`, `lz4` |
 | Encode threads | **auto** (omit `--threads`; many tiny files → 1) |
 | Encode concurrency | **0** → auto from threads |
 | Encode size budget | **500M** in-flight uncompressed (like archiveconverter nested budget) |
-| Dir size budgets | `--dir-max-size PATH=SIZE` (optional); recursive; newest-mtime-first; longest prefix wins |
-| Dir file-count limits | `--dir-max-files PATH=N` / `--dir-max-files-from` (optional); **recursive** under PATH/; longest prefix; newest-mtime-first |
+| Dir size budgets | `--dir-max-size` / **`--dir-max-size-from`** (listed prefixes only); recursive; newest-first |
+| Dir file-count limits | `--dir-max-files` / `--dir-max-files-from` (listed prefixes only); recursive; newest-first |
+| Per-path file size list | **`--file-size-from`** (`PATTERN max=SIZE`; first match; non-matches ignore list) |
 | Global size/count caps | `--max-total-size` / `--max-files` (optional); newest-mtime-first; after dir limits |
-| Per-file size/age | `--max-size` / `--min-size` (`0`=off) / `--newer-than` (e.g. `7d`); before dir budgets |
+| Global per-file size/age | `--max-size` / `--min-size` (`0`=off) / `--newer-than` (e.g. `7d`); all candidates |
 | Embed method | **Copy** `0x00` (store), no recompress |
 | Embed naming | **Basename flatten** unless `--keep-path` |
 | Overwrite | **Error** if `-o` exists unless `--force` |
@@ -128,6 +161,7 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | `src/select/from_file.rs` | include-from / exclude-from / filter files; size/line caps |
 | `src/select/walk.rs` | SRC walk + `--files-from` → `SelectedEntry`; prune; collisions |
 | `src/select/dir_budget.rs` | `--dir-max-size` + `--dir-max-files` (both recursive); `RestrictionReport` |
+| `src/select/restrict_lists.rs` | `--file-size-from`, `--dir-max-size-from` parsers/apply |
 | `src/select/global_restrict.rs` | `--max-size`/`--min-size`/`--newer-than` + global `--max-total-size`/`--max-files` |
 | `src/pipeline/output.rs` | `*.partial` naming, `--force` check, rename commit |
 | `src/pipeline/create.rs` | **`create` selection + multi-method 7z / seekable-zstd** (partial+rename, verify) |

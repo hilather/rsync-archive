@@ -16,13 +16,14 @@ use crate::cli::{CreateArgs, OutputFormat};
 use crate::error::{Error, Result};
 use crate::pipeline::output::{cleanup_partial, commit_output, prepare_output};
 use crate::select::dir_budget::{
-    apply_dir_budgets, apply_dir_file_limits, collect_dir_file_limits, parse_dir_budgets,
+    apply_dir_budgets, apply_dir_file_limits, collect_dir_budgets, collect_dir_file_limits,
     RestrictionReport,
 };
 use crate::select::from_file::{load_exclude_from, load_include_from};
 use crate::select::global_restrict::{
     apply_max_files, apply_max_total_size, apply_per_file_limits, per_file_limits_from_cli,
 };
+use crate::select::restrict_lists::{apply_file_size_from, load_file_size_from};
 use crate::select::walk::{
     collect_from_files_from, collect_from_sources, MemberKind, SelectedEntry, SelectionStats,
 };
@@ -74,14 +75,15 @@ pub fn build_rules(args: &CreateArgs) -> Result<RuleSet> {
 /// Build the full selection (same path for dry-run and write).
 ///
 /// Order of operations:
-/// 1. Rsync filters / walk (collision pre-scan K29)
-/// 2. Per-file `--max-size` / `--min-size` / `--newer-than`
-/// 3. `--dir-max-size` (recursive, newest-first) and `--dir-max-files`
-///    (immediate children only, newest-first)
-/// 4. Global `--max-total-size` / `--max-files` (newest-first)
+/// 1. Master list: rsync filters / walk or `--files-from`
+/// 2. Global per-file `--max-size` / `--min-size` / `--newer-than`
+/// 3. `--file-size-from` (only paths matching a list line; first match wins)
+/// 4. `--dir-max-size` / `--dir-max-size-from` then `--dir-max-files` /
+///    `--dir-max-files-from` (only listed directory prefixes)
+/// 5. Global `--max-total-size` / `--max-files` (newest-first)
 ///
-/// Restriction outcomes (kept + skipped under each limit) are returned for a
-/// compact stderr report — not one log line per file.
+/// Restriction list files only constrain matching paths/prefixes; other master
+/// entries ignore that list.
 pub fn build_selection(
     args: &CreateArgs,
 ) -> Result<(Vec<SelectedEntry>, SelectionStats, RestrictionReport)> {
@@ -97,7 +99,7 @@ pub fn build_selection(
     };
     let mut report = RestrictionReport::default();
 
-    // 2. Per-file size / age filters.
+    // 2. Global per-file size / age filters.
     let per_file = per_file_limits_from_cli(
         args.max_size.as_deref(),
         args.min_size.as_deref(),
@@ -105,14 +107,26 @@ pub fn build_selection(
     )?;
     let entries = apply_per_file_limits(entries, &per_file, &mut stats, &mut report)?;
 
-    // 3. Directory budgets and file-count limits.
-    let budgets = parse_dir_budgets(&args.dir_max_size)?;
-    let entries = apply_dir_budgets(entries, &budgets, &mut stats, &mut report)?;
-    let file_limits =
+    // 3. Per-path file size list (only matching paths).
+    let entries = if let Some(ref path) = args.file_size_from {
+        let file_rules = load_file_size_from(path)?;
+        apply_file_size_from(entries, &file_rules, &mut stats, &mut report)?
+    } else {
+        entries
+    };
+
+    // 4. Directory budgets and file-count limits (listed prefixes only).
+    let mut file_limits =
         collect_dir_file_limits(&args.dir_max_files, args.dir_max_files_from.as_deref())?;
+    let budgets = collect_dir_budgets(
+        &args.dir_max_size,
+        args.dir_max_size_from.as_deref(),
+        &mut file_limits,
+    )?;
+    let entries = apply_dir_budgets(entries, &budgets, &mut stats, &mut report)?;
     let entries = apply_dir_file_limits(entries, &file_limits, &mut stats, &mut report)?;
 
-    // 4. Global caps (newest-mtime-first).
+    // 5. Global caps (newest-mtime-first).
     let entries = if let Some(ref s) = args.max_total_size {
         let limit = parse_byte_size(s)?;
         apply_max_total_size(entries, limit, &mut stats, &mut report)?
@@ -197,6 +211,7 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
             skipped_dir_budget = stats.skipped_dir_budget,
             skipped_dir_file_limit = stats.skipped_dir_file_limit,
             skipped_max_size = stats.skipped_max_size,
+            skipped_file_size_from = stats.skipped_file_size_from,
             skipped_min_size = stats.skipped_min_size,
             skipped_older_than = stats.skipped_older_than,
             skipped_max_total_size = stats.skipped_max_total_size,
@@ -764,12 +779,13 @@ fn verify_create_archive(path: &Path, expected_files: usize) -> Result<()> {
 fn print_selection_summary(stats: &SelectionStats, dry_run: bool) {
     let mode = if dry_run { "dry-run" } else { "create" };
     eprintln!(
-        "{mode}: {} selected, {} excluded, {} dir-budget skipped, {} dir-file-limit skipped, {} max-size skipped, {} min-size skipped, {} older-than skipped, {} max-total-size skipped, {} max-files skipped, {} symlinks skipped, {} hardlinks skipped, {} special skipped",
+        "{mode}: {} selected, {} excluded, {} dir-budget skipped, {} dir-file-limit skipped, {} max-size skipped, {} file-size-from skipped, {} min-size skipped, {} older-than skipped, {} max-total-size skipped, {} max-files skipped, {} symlinks skipped, {} hardlinks skipped, {} special skipped",
         stats.selected,
         stats.skipped_excluded,
         stats.skipped_dir_budget,
         stats.skipped_dir_file_limit,
         stats.skipped_max_size,
+        stats.skipped_file_size_from,
         stats.skipped_min_size,
         stats.skipped_older_than,
         stats.skipped_max_total_size,
@@ -811,8 +827,10 @@ pub(crate) fn test_create_args(
         encode_concurrency: 1,
         encode_size_budget: "500M".into(),
         dir_max_size: vec![],
+        dir_max_size_from: None,
         dir_max_files: vec![],
         dir_max_files_from: None,
+        file_size_from: None,
         max_total_size: None,
         max_files: None,
         max_size: None,

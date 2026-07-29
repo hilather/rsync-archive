@@ -7,15 +7,20 @@ pub mod from_file;
 pub mod global_restrict;
 pub mod matcher;
 pub mod pathnorm;
+pub mod restrict_lists;
 pub mod rules;
 pub mod walk;
 
 pub use dir_budget::{
-    apply_dir_budgets, apply_dir_file_limits, collect_dir_file_limits, is_direct_child,
-    is_under_budget_dir, load_dir_max_files_from, normalize_budget_prefix, parse_dir_budgets,
-    parse_dir_file_limits, parse_dir_max_files_arg, parse_dir_max_size_arg, DirBudget,
-    DirBudgetOutcome, DirFileLimit, DirFileLimitOutcome, GlobalCountCapOutcome,
+    apply_dir_budgets, apply_dir_file_limits, collect_dir_budgets, collect_dir_file_limits,
+    is_direct_child, is_under_budget_dir, load_dir_max_files_from, normalize_budget_prefix,
+    parse_dir_budgets, parse_dir_file_limits, parse_dir_max_files_arg, parse_dir_max_size_arg,
+    DirBudget, DirBudgetOutcome, DirFileLimit, DirFileLimitOutcome, GlobalCountCapOutcome,
     GlobalSizeCapOutcome, RestrictionFile, RestrictionReport,
+};
+pub use restrict_lists::{
+    apply_file_size_from, load_dir_max_size_from, load_file_size_from, parse_dir_restrict_line,
+    parse_file_size_line, FileSizeRule,
 };
 pub use global_restrict::{
     apply_max_files, apply_max_total_size, apply_per_file_limits, parse_duration_secs,

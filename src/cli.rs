@@ -1,7 +1,8 @@
 //! Clap CLI surface for `rsync-archive`.
 //!
-//! Flag sets for `create` and `embed` follow `docs/DESIGN.md` (v1 freeze).
-//! Pipelines are stubbed until later stages.
+//! **Help text here is user-facing.** Keep `///` docs, `about`, and `after_help`
+//! accurate whenever flags or formats change (see `AGENTS.md` CLI policy).
+//! Short help (`-h`) shows only the first line of multi-line docs.
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
@@ -11,8 +12,19 @@ use std::path::{Path, PathBuf};
 #[command(
     name = "rsync-archive",
     version,
-    about = "Stream-create non-solid 7z with rsync selection; embed finished archives under a master store 7z",
-    long_about = None
+    about = "Stream-create archives with rsync-style selection (default: non-solid 7z); embed finished files under a store 7z",
+    long_about = "rsync-archive creates archives from the filesystem using rsync-style \
+include/exclude filters and optional size/count limits.\n\n\
+Default create format is non-solid 7z (per-file packs, random-access friendly). \
+Also: seekable-zstd, tar-zstd, tar-lz4.\n\n\
+embed wraps finished regular files (typically .7z) under a master store/Copy 7z \
+without recompression.",
+    after_help = "Examples:\n  \
+rsync-archive create -o out.7z --level 5 ./data/\n  \
+rsync-archive create -o pack.tar.zst --format tar-zstd ./logs/\n  \
+rsync-archive create -o stream.zst --format seekable-zstd ./src/\n  \
+rsync-archive embed -o master.7z nest1.7z nest2.7z\n\n\
+Use `create -h` / `embed -h` for flags; `create --help` for full long descriptions."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -25,9 +37,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Create a non-solid 7z (or seekable-zstd stream) from filesystem paths using rsync-style filters.
+    /// Create an archive (7z / seekable-zstd / tar-zstd / tar-lz4) with rsync-style selection.
     Create(CreateArgs),
-    /// Embed finished archive files under a master non-solid store 7z (Copy method).
+    /// Embed finished files under a master non-solid store 7z (Copy method, no recompress).
     Embed(EmbedArgs),
 }
 
@@ -62,15 +74,31 @@ impl OutputFormat {
 
 /// Arguments for `rsync-archive create`.
 #[derive(Debug, Parser)]
+#[command(
+    about = "Create an archive with rsync-style selection (default format: non-solid 7z)",
+    long_about = "Walk SRC paths (or --files-from), apply rsync-style filters and optional \
+size/count limits, then stream-create an archive.\n\n\
+Formats: 7z (default, --method lzma2|zstd|lz4), seekable-zstd, tar-zstd, tar-lz4. \
+Infer format from -o when --format is omitted (.tar.zst/.tzst, .tar.lz4/.tlz4, .zst, else 7z).\n\n\
+Tar formats include regular files, derived directory members, symlinks, and Unix hard links. \
+7z/seekable-zstd keep regular files only (symlinks/hard-link members skipped).",
+    after_help = "Examples:\n  \
+rsync-archive create -o out.7z --method zstd --level 5 ./data/\n  \
+rsync-archive create -o logs.tar.zst --max-total-size 100M --dir-max-files logs/=50 /var/log/\n  \
+rsync-archive create -o o.7z --files-from master.txt --file-size-from sizes.txt --dir-max-size-from dirs.txt\n  \
+rsync-archive create -o pack.tlz4 -n ./tree/   # dry-run; .tlz4 → tar-lz4\n  \
+rsync-archive create -o o.7z --exclude '*.tmp' --newer-than 7d ./src/\n\n\
+See docs/SELECTION.md for list-file formats and filter semantics; docs/FORMAT_TAR_*.md for tar layouts."
+)]
 pub struct CreateArgs {
-    /// Output archive path (`.7z`, `.zst`, `.tar.zst`, `.tzst`, `.tar.lz4`, `.tlz4`).
+    /// Output path (`.7z`, `.zst`, `.tar.zst`/`.tzst`, `.tar.lz4`/`.tlz4`).
     #[arg(short = 'o', long = "output", value_name = "OUT")]
     pub output: PathBuf,
 
-    /// Output format: `7z` (default), `seekable-zstd`, `tar-zstd`, or `tar-lz4`.
-    /// If omitted, inferred from `-o` extension
-    /// (`.tar.zst`/`.tzst` → tar-zstd; `.tar.lz4`/`.tlz4` → tar-lz4;
-    /// bare `.zst` → seekable-zstd; else 7z).
+    /// Format: `7z` (default), `seekable-zstd`, `tar-zstd`, `tar-lz4` (or infer from `-o`).
+    ///
+    /// Inference: `.tar.zst`/`.tzst` → tar-zstd; `.tar.lz4`/`.tlz4` → tar-lz4;
+    /// bare `.zst` → seekable-zstd; otherwise 7z.
     #[arg(
         long = "format",
         visible_alias = "output-format",
@@ -79,154 +107,160 @@ pub struct CreateArgs {
     )]
     pub format: Option<OutputFormat>,
 
-    /// List what would be archived without writing.
+    /// Dry-run: print selected archive paths; do not write `-o`.
     #[arg(short = 'n', long = "dry-run")]
     pub dry_run: bool,
 
-    /// Overwrite `-o` if it already exists.
+    /// Overwrite `-o` if it already exists (otherwise error).
     #[arg(long = "force")]
     pub force: bool,
 
-    /// Exclude pattern (repeatable; rsync-style).
+    /// Exclude pattern (rsync-style; repeatable; basename match if no `/`).
     #[arg(long = "exclude", value_name = "PATTERN", action = clap::ArgAction::Append)]
     pub exclude: Vec<String>,
 
-    /// Include pattern (repeatable; rsync-style).
+    /// Include pattern (rsync-style; repeatable).
     #[arg(long = "include", value_name = "PATTERN", action = clap::ArgAction::Append)]
     pub include: Vec<String>,
 
-    /// Read exclude patterns from file (one per line).
+    /// Exclude patterns from file (one per line; `#` comments).
     #[arg(long = "exclude-from", value_name = "FILE")]
     pub exclude_from: Option<PathBuf>,
 
-    /// Read include patterns from file (one per line).
+    /// Include patterns from file (one per line; `#` comments).
     #[arg(long = "include-from", value_name = "FILE")]
     pub include_from: Option<PathBuf>,
 
-    /// Explicit file list (exclusive of SRC...; paths relative to CWD unless absolute).
+    /// Explicit path list (exclusive of SRC...; relative to CWD unless absolute).
     #[arg(long = "files-from", value_name = "FILE")]
     pub files_from: Option<PathBuf>,
 
-    /// Filter rule, e.g. `+ *.rs` or `- *.tmp` (repeatable).
+    /// Filter rule such as `+ *.rs` or `- *.tmp` (repeatable; ordered).
     #[arg(long = "filter", value_name = "RULE", action = clap::ArgAction::Append)]
     pub filter: Vec<String>,
 
-    /// Compression level 0–9 (default 5). Meaning depends on format/`--method`
-    /// (LZMA2 preset / mapped Zstd level; LZ4 ignores fine-grained levels).
+    /// Compression level 0–9 (default 5; LZMA2/Zstd mapping; LZ4 mostly ignores).
     #[arg(long = "level", default_value_t = 5, value_parser = clap::value_parser!(u32).range(0..=9))]
     pub level: u32,
 
-    /// Compression method for **7z** format only: `lzma2` (default), `zstd`, or `lz4`.
-    /// All produce **non-solid** per-file packs (file-level random access).
-    /// Not used with `--format seekable-zstd` / `tar-zstd` / `tar-lz4`
-    /// (error if set to a non-default value).
+    /// 7z-only method: `lzma2` (default), `zstd`, or `lz4` (non-solid packs; error on tar formats).
     #[arg(long = "method", default_value = "lzma2")]
     pub method: String,
 
-    /// Encode worker count (archiveconverter-style). Omit for auto:
-    /// many tiny files → 1; else available CPU parallelism.
-    /// Applies to **7z** create only.
+    /// 7z encode workers (omit = auto: many tiny files → 1, else CPU count).
     #[arg(long)]
     pub threads: Option<u32>,
 
-    /// Max concurrent file encodes (`0` = auto from `--threads` / CPUs).
-    /// Same idea as archiveconverter `--nested-concurrency`. **7z** only.
+    /// 7z max concurrent file encodes (`0` = auto from `--threads` / CPUs).
     #[arg(long = "encode-concurrency", default_value_t = 0)]
     pub encode_concurrency: usize,
 
-    /// Max total **uncompressed** size of files encoding at once (default `500M`).
-    /// `0` = no size cap. Same default as archiveconverter `--nested-size-budget`. **7z** only.
+    /// 7z max in-flight uncompressed encode size (default `500M`; `0` = unlimited).
     #[arg(long = "encode-size-budget", default_value = "500M")]
     pub encode_size_budget: String,
 
-    /// Cap total selected bytes under an archive-relative directory (repeatable).
+    /// Cap selected bytes under dir PATH (recursive; `PATH=SIZE`; newest-mtime first).
     ///
-    /// Format: `PATH=SIZE` (e.g. `logs/=100M`, `cache=50M`). After normal filters,
-    /// files under `PATH` are considered newest-mtime-first; further files that
-    /// would exceed the budget are skipped (counted as dir-budget skips).
-    /// Nested budgets: longest matching prefix wins. Scope is **recursive**.
+    /// Example: `logs/=100M`. Nested budgets: longest matching prefix wins.
+    /// Applied after filters and per-file size/age limits. Only listed dirs are capped.
     #[arg(long = "dir-max-size", value_name = "PATH=SIZE", action = clap::ArgAction::Append)]
     pub dir_max_size: Vec<String>,
 
-    /// Cap number of selected files that are **direct children** of a directory
-    /// (repeatable). Nested files under subdirectories are not counted.
+    /// Dir size/count list file (rsync-like: `logs/ max=500M`, `logs/ files=100`, or `logs/=100M`).
     ///
-    /// Format: `PATH=N` (e.g. `logs/=10`, `cache=5`). After filters (and size
-    /// budgets), direct children of `PATH` are considered newest-mtime-first;
-    /// only the `N` newest are kept.
+    /// Only prefixes in the file are restricted; other master-list paths ignore this list.
+    /// `files=N` lines merge with `--dir-max-files` / `--dir-max-files-from`.
+    #[arg(long = "dir-max-size-from", value_name = "FILE")]
+    pub dir_max_size_from: Option<PathBuf>,
+
+    /// Cap selected file count under dir PATH (recursive; `PATH=N`; newest-mtime first).
+    ///
+    /// Example: `logs/=10`. Nested limits: longest matching prefix wins.
+    /// Applied after filters, per-file limits, and size budgets.
     #[arg(long = "dir-max-files", value_name = "PATH=N", action = clap::ArgAction::Append)]
     pub dir_max_files: Vec<String>,
 
-    /// Read `--dir-max-files` lines from a file (`PATH=N` per line; `#` comments OK).
+    /// Dir file-count list (`PATH=N` or `PATH/ files=N`; `#` comments OK).
     #[arg(long = "dir-max-files-from", value_name = "FILE")]
     pub dir_max_files_from: Option<PathBuf>,
 
-    /// Global cap on total selected uncompressed bytes (newest-mtime-first fill).
+    /// Per-path max-size list (rsync-like: `**/*.log max=100M`). Only matching paths capped.
     ///
-    /// Applied after filters, per-file size/age limits, and directory budgets.
-    /// Further files that would exceed the budget are skipped (compact report).
+    /// First matching line wins. Paths not matched by any line ignore this list.
+    #[arg(long = "file-size-from", value_name = "FILE")]
+    pub file_size_from: Option<PathBuf>,
+
+    /// Global cap on selected uncompressed bytes (newest-mtime first; after dir limits).
     #[arg(long = "max-total-size", value_name = "SIZE")]
     pub max_total_size: Option<String>,
 
-    /// Global max number of selected files (newest-mtime-first).
+    /// Global max selected file count (newest-mtime first).
     #[arg(long = "max-files", value_name = "N")]
     pub max_files: Option<u64>,
 
-    /// Skip any single file larger than SIZE (e.g. `100M`).
+    /// Skip any single file larger than SIZE (global; e.g. `100M`). Prefer `--file-size-from` for per-path.
     #[arg(long = "max-size", value_name = "SIZE")]
     pub max_size: Option<String>,
 
-    /// Skip files smaller than SIZE (`0` or omit = off).
+    /// Skip files smaller than SIZE (`0` or omit = off). Global only.
     #[arg(long = "min-size", value_name = "SIZE")]
     pub min_size: Option<String>,
 
-    /// Only files with mtime within the last DURATION (e.g. `7d`, `24h`, `30m`, `90s`).
+    /// Keep only files with mtime within DURATION (e.g. `7d`, `24h`, `30m`, `90s`).
     #[arg(long = "newer-than", value_name = "DURATION")]
     pub newer_than: Option<String>,
 
-    /// After write, list/test the archive.
+    /// After write, verify archive (member count / sample extract by format).
     #[arg(long = "verify")]
     pub verify: bool,
 
-    /// Source paths (dirs and/or files). Required unless `--files-from` is set.
-    ///
-    /// Stored as strings so a trailing `/` is preserved (rsync-style naming).
+    /// Source paths (dirs/files). Required unless `--files-from`. Trailing `/` strips dir name.
     #[arg(value_name = "SRC")]
     pub sources: Vec<String>,
 }
 
 /// Arguments for `rsync-archive embed`.
 #[derive(Debug, Parser)]
+#[command(
+    about = "Embed finished files under a master non-solid store 7z (Copy, no recompress)",
+    long_about = "Wrap finished regular files (typically non-solid .7z nested archives) under \
+a master 7z using the store/Copy method (no recompression).\n\n\
+Default member names are basenames; use --keep-path and optional --prefix for tree names.",
+    after_help = "Examples:\n  \
+rsync-archive embed -o master.7z nest1.7z nest2.7z\n  \
+rsync-archive embed -o master.7z --keep-path --prefix packs/ ./build/a.7z\n  \
+rsync-archive embed -o master.7z --require-7z --verify a.7z b.7z"
+)]
 pub struct EmbedArgs {
     /// Output master archive path (`.7z`).
     #[arg(short = 'o', long = "output", value_name = "OUT")]
     pub output: PathBuf,
 
-    /// List members without writing.
+    /// Dry-run: list planned member names; do not write `-o`.
     #[arg(short = 'n', long = "dry-run")]
     pub dry_run: bool,
 
-    /// Overwrite `-o` if it already exists.
+    /// Overwrite `-o` if it already exists (otherwise error).
     #[arg(long = "force")]
     pub force: bool,
 
-    /// Prefix for all member names (relative path, no `..`).
+    /// Prefix all member names (relative path; no `..`).
     #[arg(long = "prefix", value_name = "PREFIX")]
     pub prefix: Option<String>,
 
-    /// Use normalized input path as member name (default is basename flatten).
+    /// Keep normalized input path as member name (default: basename only).
     #[arg(long = "keep-path")]
     pub keep_path: bool,
 
-    /// Hard-error if an input is missing 7z magic.
+    /// Error if an input is missing 7z magic (conflicts with `--allow-any`).
     #[arg(long = "require-7z", conflicts_with = "allow_any")]
     pub require_7z: bool,
 
-    /// Allow arbitrary regular files as store members; skip magic warning.
+    /// Allow any regular file as a store member; skip non-7z magic warning.
     #[arg(long = "allow-any", conflicts_with = "require_7z")]
     pub allow_any: bool,
 
-    /// After write, list/test the archive.
+    /// After write, verify master archive (list/test members).
     #[arg(long = "verify")]
     pub verify: bool,
 
@@ -361,8 +395,10 @@ mod tests {
             encode_concurrency: 0,
             encode_size_budget: "500M".into(),
             dir_max_size: vec![],
+            dir_max_size_from: None,
             dir_max_files: vec![],
             dir_max_files_from: None,
+            file_size_from: None,
             max_total_size: None,
             max_files: None,
             max_size: None,

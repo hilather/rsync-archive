@@ -336,6 +336,57 @@ Walk and `--files-from` select:
 
 ---
 
+## List files overview (master vs restriction)
+
+| Role | Flag(s) | Applied to |
+|------|---------|------------|
+| **Master collect** | `SRC...` **or** `--files-from` | What enters the candidate set |
+| **Rsync include/exclude** | `--include`/`--exclude`/`--filter` + `*-from` | Filter master set |
+| **Per-path file size** | **`--file-size-from`** | Only paths matching a line; others **ignore** this list |
+| **Dir byte/count** | `--dir-max-size`, **`--dir-max-size-from`**, `--dir-max-files`, `--dir-max-files-from` | Only listed directory prefixes; others **ignore** |
+| **Global** | `--max-size`, `--min-size`, `--newer-than`, `--max-total-size`, `--max-files` | **All** remaining candidates when set |
+
+**Ignore rule:** a restriction list never drops a master-list entry unless that entry
+matches a rule/prefix in **that** list. Unlisted paths skip that list entirely.
+
+Implementation: `src/select/restrict_lists.rs`, `dir_budget.rs`, `global_restrict.rs`.
+
+### Restriction list line format (rsync-like + fields)
+
+Blank lines and `#` comments skipped. Same **10 MiB / 1_000_000 line** caps as filter files.
+
+**`--file-size-from`** (max only; no `min=`):
+
+```text
+# PATTERN  max=SIZE
+**/*.log          max=100M
+var/log/app.log   max=10M
+max=50M           core
+```
+
+- Pattern uses the same glob rules as rsync filters (`*`, `**`, `?`, basename if no `/`).
+- Exactly one `max=SIZE` per line. **First matching line wins.**
+- Paths not matched by any line are not size-capped by this file.
+
+**`--dir-max-size-from`**:
+
+```text
+# DIR/  max=SIZE  [files=N]
+logs/             max=500M
+logs/             files=100
+cache/            max=1G files=50
+logs/=100M        # legacy PATH=SIZE (size only)
+```
+
+- Prefix normalized like archive dirs (trailing `/` optional).
+- `files=N` merges into the same file-count limit set as `--dir-max-files`.
+- Only files under listed prefixes are budgeted/counted.
+
+**`--dir-max-files-from`**: legacy `PATH=N` **or** `PATH/ files=N` (files only; use
+`--dir-max-size-from` for `max=`).
+
+---
+
 ## Directory size budgets (`--dir-max-size`)
 
 After normal include/exclude selection (and collision checks), optional per-directory
@@ -344,10 +395,11 @@ After normal include/exclude selection (and collision checks), optional per-dire
 | Flag | Format | Example |
 |------|--------|---------|
 | `--dir-max-size` (repeatable) | `PATH=SIZE` | `--dir-max-size logs/=100M` |
+| `--dir-max-size-from` | rsync-like list (above) | `--dir-max-size-from dirs.txt` |
 
 - **PATH** — archive-relative directory prefix (trailing `/` optional; normalized like member paths; no `..`).
 - **SIZE** — same syntax as encode budgets (`100M`, `1G`, `500K`, raw bytes).
-- **Order of operations:** rsync filters → per-file size/age limits (if any) → budget post-process on the candidate list.
+- **Order of operations:** see pipeline below.
 - **Scope:** recursive regular files whose `archive_name` is under `PATH/` (not a file named exactly `PATH`).
 - **Ordering:** under each budget, sort by **mtime descending**, then `archive_name` ascending.
 - **Accumulation:** include while `running_sum + size ≤ limit`; further files are **budget-skips** (not rsync excludes).
@@ -368,11 +420,10 @@ limits cap how many selected files are kept under a directory **tree**.
 | Flag | Format | Example |
 |------|--------|---------|
 | `--dir-max-files` (repeatable) | `PATH=N` | `--dir-max-files logs/=10` |
-| `--dir-max-files-from` | file of `PATH=N` lines | `--dir-max-files-from limits.txt` |
+| `--dir-max-files-from` | `PATH=N` or `PATH/ files=N` | `--dir-max-files-from limits.txt` |
 
 - **PATH** — archive-relative directory prefix (trailing `/` optional; same normalization as size budgets; no `..`).
 - **N** — non-negative integer (max files kept under the tree).
-- **Order of operations:** rsync filters → per-file size/age (if any) → `--dir-max-size` → file-count limits → global caps.
 - **Scope:** **recursive** under `PATH/` (same as size budgets). Nested limits: **longest matching prefix** wins. Collection filters are an independent rule set.
 - **Ordering:** under each limit, sort by **mtime descending**, then `archive_name` ascending; keep the first `N`.
 - **List file:** blank lines and `#` comments skipped; same size/line caps as other from-files; duplicate prefixes (CLI ↔ file) error.
@@ -392,10 +443,11 @@ final selection is empty on write).
 
 ### Order of operations (`build_selection`)
 
-1. Rsync filters / walk (`--include` / `--exclude` / `--files-from`, …)
-2. **Per-file:** `--max-size`, `--min-size`, `--newer-than`
-3. **Directory:** `--dir-max-size` then `--dir-max-files` / `--dir-max-files-from`
-4. **Global:** `--max-total-size` then `--max-files`
+1. Master list: rsync filters / walk (`--include` / `--exclude` / `--files-from`, …)
+2. **Global per-file:** `--max-size`, `--min-size`, `--newer-than` (all candidates)
+3. **`--file-size-from`:** only matching patterns (first match wins)
+4. **Directory:** `--dir-max-size` / `--dir-max-size-from` then `--dir-max-files` / `--dir-max-files-from`
+5. **Global:** `--max-total-size` then `--max-files`
 
 | Flag | Format | Behavior |
 |------|--------|----------|
