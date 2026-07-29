@@ -85,14 +85,22 @@ jobs:
       - name: Install Rust
         run: |
           set -eux
+          export CARGO_HOME="${GITHUB_WORKSPACE}/.cargo"
+          export RUSTUP_HOME="${GITHUB_WORKSPACE}/.rustup"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain stable --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "CARGO_HOME=${CARGO_HOME}" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUSTUP_HOME}" >> "$GITHUB_ENV"
+          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
 
       - name: Build release binary
         run: |
           set -eux
-          source "$HOME/.cargo/env" 2>/dev/null || true
+          export CARGO_HOME="${CARGO_HOME:-$GITHUB_WORKSPACE/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$GITHUB_WORKSPACE/.rustup}"
+          export PATH="${CARGO_HOME}/bin:${PATH}"
+          rustc --version
+          cargo --version
           cargo build --release --locked --bin rsync-archive
 
       - name: Package
