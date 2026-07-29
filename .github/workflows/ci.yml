@@ -84,31 +84,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      # GITHUB_PATH is unreliable across steps in some containers (exit 127).
+      # Install Rust and build in one step so PATH is always correct.
+      - name: Install Rust and build (release)
         run: |
           set -eux
-          # Pin homes so PATH is stable across container steps (exit 127 otherwise).
-          export CARGO_HOME="${GITHUB_WORKSPACE}/.cargo"
-          export RUSTUP_HOME="${GITHUB_WORKSPACE}/.rustup"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain stable --profile minimal
-          echo "CARGO_HOME=${CARGO_HOME}" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=${RUSTUP_HOME}" >> "$GITHUB_ENV"
-          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
-
-      - name: Build (release)
-        run: |
-          set -eux
-          export CARGO_HOME="${CARGO_HOME:-$GITHUB_WORKSPACE/.cargo}"
-          export RUSTUP_HOME="${RUSTUP_HOME:-$GITHUB_WORKSPACE/.rustup}"
-          export PATH="${CARGO_HOME}/bin:${PATH}"
+          # shellcheck source=/dev/null
+          . "$HOME/.cargo/env"
           rustc --version
           cargo --version
           cargo build --release --locked --bins
-
-      - name: Smoke binary
-        run: |
-          set -eux
           ./target/release/rsync-archive --version
           ./target/release/rsync-archive create --help | head -5
 

@@ -82,35 +82,22 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install Rust, build, and package
         run: |
           set -eux
-          export CARGO_HOME="${GITHUB_WORKSPACE}/.cargo"
-          export RUSTUP_HOME="${GITHUB_WORKSPACE}/.rustup"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain stable --profile minimal
-          echo "CARGO_HOME=${CARGO_HOME}" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=${RUSTUP_HOME}" >> "$GITHUB_ENV"
-          echo "${CARGO_HOME}/bin" >> "$GITHUB_PATH"
-
-      - name: Build release binary
-        run: |
-          set -eux
-          export CARGO_HOME="${CARGO_HOME:-$GITHUB_WORKSPACE/.cargo}"
-          export RUSTUP_HOME="${RUSTUP_HOME:-$GITHUB_WORKSPACE/.rustup}"
-          export PATH="${CARGO_HOME}/bin:${PATH}"
+          # shellcheck source=/dev/null
+          . "$HOME/.cargo/env"
           rustc --version
           cargo --version
           cargo build --release --locked --bin rsync-archive
-
-      - name: Package
-        run: |
-          set -eux
           BIN=rsync-archive-rocky${{ matrix.rocky }}-x86_64
           cp target/release/rsync-archive "$BIN"
           chmod +x "$BIN"
           tar -czf "${BIN}.tar.gz" "$BIN"
           sha256sum "${BIN}.tar.gz" > "${BIN}.tar.gz.sha256"
+          ./"$BIN" --version
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
