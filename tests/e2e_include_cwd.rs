@@ -95,3 +95,36 @@ fn include_cwd_merges_with_src() {
         .stdout(predicate::str::contains("root.txt"))
         .stdout(predicate::str::contains("e.txt"));
 }
+
+/// Regression: filter files ending in `- *` must not wipe `--include-cwd` members.
+#[test]
+fn include_cwd_ignores_rsync_star_exclude() {
+    let dir = tempdir().unwrap();
+    let cwd = dir.path();
+    fs::write(cwd.join("readme.md"), b"meta").unwrap();
+    fs::write(cwd.join("notes.txt"), b"notes").unwrap();
+    fs::create_dir_all(cwd.join("data/keep")).unwrap();
+    fs::write(cwd.join("data/keep/a.log"), b"log").unwrap();
+
+    let filter = cwd.join("rules.txt");
+    // Would exclude everything if applied to CWD pack.
+    fs::write(&filter, "+ /data/\n+ /data/**\n- *\n").unwrap();
+
+    // CWD-only: still get root files + data tree (no filters on include-cwd).
+    bin()
+        .current_dir(cwd)
+        .args([
+            "create",
+            "-o",
+            "pack.7z",
+            "--include-cwd",
+            "--filter-from",
+            filter.to_str().unwrap(),
+            "-n",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("readme.md"))
+        .stdout(predicate::str::contains("notes.txt"))
+        .stdout(predicate::str::contains("data/keep/a.log"));
+}

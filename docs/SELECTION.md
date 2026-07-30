@@ -542,7 +542,11 @@ member names are archive-**root** relative (`./a.txt` → `a.txt`, not `cwdname/
 - May be used **alone** (no `SRC` / `--files-from`).
 - Always skips the create **`-o`** path and its **`{out}.partial`** sibling so the tool
   does not archive its own output or in-progress temp.
-- Same include/exclude / restriction pipeline as other selected files.
+- **Does not apply rsync include/exclude / `--filter-from` rules.** Those filters apply
+  only to SRC / `--files-from` selection. CWD packing is “everything under CWD at
+  archive root” (still subject to later size/count restrictions: dir budgets,
+  `--file-size-from`, global caps). Otherwise a filter file ending in `- *` would
+  drop all root-level CWD members.
 2. **Global per-file:** `--max-size`, `--min-size`, `--newer-than` (all candidates)
 3. **`--file-size-from`:** only matching patterns (first match wins)
 4. **Directory:** `--dir-max-size` / `--dir-max-size-from` then `--dir-max-files` / `--dir-max-files-from`

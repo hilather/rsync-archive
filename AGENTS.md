@@ -142,7 +142,7 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | Symlinks | **tar-zstd / tar-lz4:** archived as typeflag `'2'` (linkname; size 0). **7z / seekable-zstd:** skipped (counted). Special files always skipped. |
 | Hard links | **Unix:** first `(dev,ino)` path is full file; later → `HardLink` (size 0). **tar-zstd / tar-lz4:** typeflag `'1'` (linkname = first archive path). **7z / seekable-zstd:** skip hard-link members (keep first file). Non-Unix: no detection. |
 | `--files-from` | Exclusive of `SRC...`; paths relative to **CWD** unless absolute |
-| `--include-cwd` | **Off** by default; when on, pack CWD at archive root; skip `-o` and `.partial` |
+| `--include-cwd` | **Off** by default; pack CWD at archive root; skip `-o`/`.partial`; **no rsync filters** on CWD |
 | Patterns without `/` (and without `**`) | Match **basename** (e.g. `*.tmp` matches `dir/a.tmp`); unanchored multi-segment end-anchored; prefer `--filter-from` for ordered mixes |
 | Streaming | Peak RAM O(dict + I/O buffers), not O(file size) for create |
 

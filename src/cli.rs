@@ -155,7 +155,9 @@ pub struct CreateArgs {
     /// Also pack all files under the process CWD at archive root (trailing-`/` style).
     ///
     /// Off by default. Skips the `-o` output file and its `.partial` temp. Combines
-    /// with SRC... or `--files-from`, or may be used alone. Same include/exclude rules apply.
+    /// with SRC... or `--files-from`, or may be used alone.
+    /// **Ignores rsync include/exclude filters** (those apply only to SRC/`--files-from`);
+    /// otherwise a trailing `- *` in a filter file would drop every CWD root file.
     #[arg(long = "include-cwd", default_value_t = false)]
     pub include_cwd: bool,
 

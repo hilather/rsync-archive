@@ -110,7 +110,7 @@ Default create remains **non-solid 7z** with **`--method lzma2`**.
 
 **Trailing `/` on SRC** strips the directory name from archive paths (`photos/` → `a.jpg`; `photos` → `photos/a.jpg`).  
 **`--files-from`:** exclusive of `SRC...`; relative lines keep path as member name; absolute lines use basename.  
-**`--include-cwd`:** (off by default) also pack files under the process CWD at **archive root** (like a trailing `/` on `.`); skips the `-o` output and its `.partial` temp. May be used alone or with `SRC...` / `--files-from`.  
+**`--include-cwd`:** (off by default) pack files under the process CWD at **archive root** (like a trailing `/` on `.`); skips `-o` / `.partial`. **Ignores rsync filters** (filters apply to SRC/`--files-from` only). May be used alone or with `SRC...` / `--files-from`.  
 
 **Filters:** see [`docs/SELECTION.md`](docs/SELECTION.md) and [`docs/RSYNC_PARITY.md`](docs/RSYNC_PARITY.md). Rule build order: `include-from` → `exclude-from` → **`filter-from`** → `--filter` → `--include` → `--exclude`. Prefer **`--filter-from`** / `--filter` for ordered mixes (`--include`/`--exclude` are batched, not CLI-interleaved).  
 **Restriction list files** (only matching paths/prefixes; others ignore that list):  
@@ -284,8 +284,8 @@ Docs: [`docs/BENCH.md`](docs/BENCH.md) · published numbers: [`docs/bench/RESULT
 
 ```bash
 # Cut a release (maintainers)
-git tag -a v0.5.1 -m "v0.5.1"
-git push origin v0.5.1
+git tag -a v0.5.2 -m "v0.5.2"
+git push origin v0.5.2
 
 # Install from a release asset
 tar -xzf rsync-archive-rocky8-x86_64.tar.gz

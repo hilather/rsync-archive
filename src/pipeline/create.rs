@@ -108,7 +108,8 @@ pub fn build_selection(
     };
 
     if args.include_cwd {
-        let (cwd_entries, cwd_stats) = collect_include_cwd(&rules, &args.output)?;
+        // CWD pack ignores rsync filters (see collect_include_cwd).
+        let (cwd_entries, cwd_stats) = collect_include_cwd(&args.output)?;
         merge_selection(&mut entries, &mut stats, cwd_entries, cwd_stats)?;
     }
 
@@ -159,12 +160,11 @@ pub fn build_selection(
 
 /// Walk process CWD with trailing-slash semantics (members at archive root).
 ///
-/// Excludes the create `-o` path and its `.partial` sibling so the tool does not
-/// archive its own output/temp.
-fn collect_include_cwd(
-    rules: &RuleSet,
-    output: &Path,
-) -> Result<(Vec<SelectedEntry>, SelectionStats)> {
+/// **Does not apply rsync include/exclude filters.** Filters are for SRC /
+/// `--files-from` selection; `--include-cwd` means “pack everything under CWD
+/// at archive root” (minus the create `-o` and its `.partial` temp). Otherwise
+/// a common filter file ending in `- *` would drop all CWD root files.
+fn collect_include_cwd(output: &Path) -> Result<(Vec<SelectedEntry>, SelectionStats)> {
     let cwd = std::env::current_dir().map_err(|e| {
         Error::Selection(format!("cwd for --include-cwd: {e}"))
     })?;
@@ -174,7 +174,8 @@ fn collect_include_cwd(
         trailing_slash: true,
         kind: crate::select::SourceKind::Dir,
     };
-    let (entries, mut stats) = collect_from_sources(&[spec], rules)?;
+    // Empty rules → default include (see SELECTION.md).
+    let (entries, mut stats) = collect_from_sources(&[spec], &RuleSet::new())?;
     let skip = output_artifact_paths(output);
     let before = entries.len();
     let filtered: Vec<SelectedEntry> = entries
