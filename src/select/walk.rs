@@ -389,17 +389,22 @@ fn take_walk_entry(
 
 fn is_skippable_walk_io(e: &walkdir::Error) -> bool {
     match e.io_error() {
-        Some(ioe) => matches!(
-            ioe.kind(),
-            std::io::ErrorKind::NotFound
-                | std::io::ErrorKind::PermissionDenied
-                | std::io::ErrorKind::Interrupted
-                // Linux: often returned for /proc races / weird mounts
-                | std::io::ErrorKind::InvalidInput
-        ),
+        Some(ioe) => is_skippable_fs_io(ioe),
         // Loop detection etc. are not skippable.
         None => false,
     }
+}
+
+/// Transient FS failures that should not abort selection (races under `/tmp`, `/proc`, …).
+fn is_skippable_fs_io(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::Interrupted
+            // Linux: often returned for /proc races / weird mounts
+            | std::io::ErrorKind::InvalidInput
+    )
 }
 
 /// Absolute virtual-filesystem roots that are not useful archive content when
@@ -495,10 +500,23 @@ fn consider_file(
     names: &mut HashSet<String>,
     inode_first: &mut InodeFirstMap,
 ) -> Result<()> {
-    // Non-following metadata at selection time.
-    let meta = std::fs::symlink_metadata(path).map_err(|e| {
-        Error::Selection(format!("stat {}: {e}", path.display()))
-    })?;
+    // Non-following metadata at selection time. Files under /tmp (and similar)
+    // can vanish between readdir and stat — soft-skip rather than abort create.
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if is_skippable_fs_io(&e) => {
+            stats.skipped_special += 1;
+            debug!(
+                path = %path.display(),
+                error = %e,
+                "skip vanished or inaccessible file at stat"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(Error::Selection(format!("stat {}: {e}", path.display())));
+        }
+    };
     if meta.file_type().is_symlink() {
         return consider_symlink(path, archive_name, rules, cwd, out, stats, names);
     }
@@ -591,9 +609,21 @@ fn consider_symlink(
     stats: &mut SelectionStats,
     names: &mut HashSet<String>,
 ) -> Result<()> {
-    let meta = std::fs::symlink_metadata(path).map_err(|e| {
-        Error::Selection(format!("lstat {}: {e}", path.display()))
-    })?;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if is_skippable_fs_io(&e) => {
+            stats.skipped_special += 1;
+            debug!(
+                path = %path.display(),
+                error = %e,
+                "skip vanished or inaccessible symlink at lstat"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(Error::Selection(format!("lstat {}: {e}", path.display())));
+        }
+    };
     if !meta.file_type().is_symlink() {
         stats.skipped_special += 1;
         return Ok(());
@@ -609,9 +639,23 @@ fn consider_symlink(
         return Err(Error::Collision(archive_name.to_string()));
     }
 
-    let target_path = std::fs::read_link(path).map_err(|e| {
-        Error::Selection(format!("read_link {}: {e}", path.display()))
-    })?;
+    let target_path = match std::fs::read_link(path) {
+        Ok(t) => t,
+        Err(e) if is_skippable_fs_io(&e) => {
+            // Undo name reservation so a later path can reuse it (unlikely).
+            names.remove(archive_name);
+            stats.skipped_special += 1;
+            debug!(
+                path = %path.display(),
+                error = %e,
+                "skip vanished symlink at read_link"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(Error::Selection(format!("read_link {}: {e}", path.display())));
+        }
+    };
     let target = link_target_string(&target_path)?;
 
     let abs_path = if path.is_absolute() {
@@ -889,6 +933,51 @@ mod tests {
         assert!(!is_virtual_fs_tree(Path::new("/proc"), Path::new("/proc")));
         assert!(!is_virtual_fs_tree(Path::new("/proc/1"), Path::new("/proc")));
         assert!(!is_virtual_fs_tree(Path::new("/home"), Path::new("/")));
+    }
+
+    #[test]
+    fn consider_file_skips_vanished_path() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("already-gone.tmp");
+        let mut out = Vec::new();
+        let mut stats = SelectionStats::default();
+        let mut names = HashSet::new();
+        let mut inode_first = InodeFirstMap::new();
+        consider_file(
+            &missing,
+            "already-gone.tmp",
+            &RuleSet::new(),
+            dir.path(),
+            &mut out,
+            &mut stats,
+            &mut names,
+            &mut inode_first,
+        )
+        .expect("vanished path must not abort selection");
+        assert!(out.is_empty());
+        assert_eq!(stats.skipped_special, 1);
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn consider_symlink_skips_vanished_path() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("gone-link");
+        let mut out = Vec::new();
+        let mut stats = SelectionStats::default();
+        let mut names = HashSet::new();
+        consider_symlink(
+            &missing,
+            "gone-link",
+            &RuleSet::new(),
+            dir.path(),
+            &mut out,
+            &mut stats,
+            &mut names,
+        )
+        .expect("vanished symlink must not abort selection");
+        assert!(out.is_empty());
+        assert_eq!(stats.skipped_special, 1);
     }
 
     #[test]

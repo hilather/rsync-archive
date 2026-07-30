@@ -1,6 +1,6 @@
 # First-class release: tag v* → multi-distro build artifacts + GitHub Release.
 #
-# Assets: release binaries named rsync-archive-<os>-x86_64
+# Assets: tarballs named rsync-archive-<os>-x86_64.tar.gz containing binary `rsync-archive`.
 # Built with default features (portable pure-Rust codecs).
 
 name: Release
@@ -45,12 +45,14 @@ jobs:
       - name: Package
         run: |
           set -eux
-          BIN=rsync-archive-ubuntu${{ matrix.ver }}-x86_64
-          cp target/release/rsync-archive "$BIN"
-          chmod +x "$BIN"
-          tar -czf "${BIN}.tar.gz" "$BIN"
-          sha256sum "${BIN}.tar.gz" > "${BIN}.tar.gz.sha256"
-          ./target/release/rsync-archive --version | tee version.txt
+          # Binary inside the archive is always plain `rsync-archive`.
+          # Distro tag is only on the .tar.gz name for GitHub asset selection.
+          PKG=rsync-archive-ubuntu${{ matrix.ver }}-x86_64
+          cp target/release/rsync-archive rsync-archive
+          chmod +x rsync-archive
+          tar -czf "${PKG}.tar.gz" rsync-archive
+          sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+          ./rsync-archive --version | tee version.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -92,12 +94,13 @@ jobs:
           rustc --version
           cargo --version
           cargo build --release --locked --bin rsync-archive
-          BIN=rsync-archive-rocky${{ matrix.rocky }}-x86_64
-          cp target/release/rsync-archive "$BIN"
-          chmod +x "$BIN"
-          tar -czf "${BIN}.tar.gz" "$BIN"
-          sha256sum "${BIN}.tar.gz" > "${BIN}.tar.gz.sha256"
-          ./"$BIN" --version
+          # Binary inside the archive is always plain `rsync-archive`.
+          PKG=rsync-archive-rocky${{ matrix.rocky }}-x86_64
+          cp target/release/rsync-archive rsync-archive
+          chmod +x rsync-archive
+          tar -czf "${PKG}.tar.gz" rsync-archive
+          sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+          ./rsync-archive --version
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -138,9 +141,9 @@ jobs:
             Multi-distro release builds (x86_64, default features).
 
             ### Highlights
-            - Walk robustness: soft-skip `/proc` races and unreadable dirs when packing broad trees
-            - **`--include-cwd`**: pack process CWD at archive root (off by default; skips `-o` / `.partial`)
-            - Restriction list files; RA-friendly tar-zstd/tar-lz4; non-solid 7z default
+            - Release tarballs contain binary **`rsync-archive`** (no OS/version suffix in the binary name)
+            - Walk robustness: soft-skip vanished `/tmp` files, `/proc` races, unreadable dirs
+            - **`--include-cwd`**, restriction lists, tar-zstd/tar-lz4, non-solid 7z default
 
             ### Supported CI targets
             | Distro | Versions |
@@ -150,10 +153,11 @@ jobs:
 
             ### Assets
             Download the tarball matching your OS (glibc-linked; built on that distro).
+            Each archive contains a binary named **`rsync-archive`** (no OS/version suffix).
 
             ```bash
             tar -xzf rsync-archive-<distro>-x86_64.tar.gz
-            ./rsync-archive-<distro>-x86_64 --version
+            ./rsync-archive --version
             ```
 
             Default features: pure-Rust LZMA2 + zstd + lz4_flex (no system liblzma required).

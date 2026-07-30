@@ -279,12 +279,16 @@ Docs: [`docs/BENCH.md`](docs/BENCH.md) · published numbers: [`docs/bench/RESULT
 | Workflow | When | What |
 |----------|------|------|
 | **CI** (`.github/workflows/ci.yml`) | push/PR to `main` | **Build** on Ubuntu **22.04** / **24.04** and Rocky Linux **8** / **9** / **10**; full `cargo test` on Ubuntu 24.04 |
-| **Release** (`.github/workflows/release.yml`) | tag `v*` | Release binaries per distro + GitHub Release assets |
+| **Release** (`.github/workflows/release.yml`) | tag `v*` | Per-distro `.tar.gz` assets; each contains binary **`rsync-archive`** (no OS suffix) |
 
 ```bash
 # Cut a release (maintainers)
-git tag -a v0.4.1 -m "v0.4.1"
-git push origin v0.4.1
+git tag -a v0.4.2 -m "v0.4.2"
+git push origin v0.4.2
+
+# Install from a release asset
+tar -xzf rsync-archive-rocky8-x86_64.tar.gz
+./rsync-archive --version
 ```
 
 Rocky builds run in official `rockylinux/rockylinux` containers. Ubuntu uses GitHub-hosted runners.

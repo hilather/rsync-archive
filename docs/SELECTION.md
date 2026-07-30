@@ -308,9 +308,11 @@ Automated: `tests/filter_parity.rs` (extends this table).
 ### Walk robustness
 
 Directory walks soft-skip common transient failures (`ENOENT`, `EACCES`, …) so packing
-broad trees (especially `/` or `--include-cwd` when CWD is `/`) does not abort on
-`/proc` races or unreadable dirs. On Unix, when the walk root is **not** under
-`/proc`, `/sys`, `/dev`, or `/run`, those virtual filesystems are not entered.
+broad trees (especially `/`, `/tmp`, or `--include-cwd` when CWD is `/`) does not abort on
+`/proc` races, vanished temp files between readdir and `stat`, or unreadable dirs.
+On Unix, when the walk root is **not** under `/proc`, `/sys`, `/dev`, or `/run`, those
+virtual filesystems are not entered. Explicit `--files-from` paths that are missing
+still error (user-listed path).
 
 Walk and `--files-from` select:
 
