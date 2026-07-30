@@ -324,29 +324,6 @@ fn write_frame_table_footer<W: Write>(
     Ok(())
 }
 
-fn stream_file_into_writer<W: Write>(
-    writer: &mut MultiFrameWriter<W>,
-    path: &Path,
-    expected_len: u64,
-) -> Result<u64> {
-    if expected_len == 0 {
-        return Ok(0);
-    }
-    let mut f = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if crate::util::is_skippable_fs_io(&e) => {
-            return Err(Error::Vanished(path.to_path_buf()));
-        }
-        Err(e) => {
-            return Err(Error::Archive(format!(
-                "open {} for tar.lz4: {e}",
-                path.display()
-            )));
-        }
-    };
-    stream_reader_into_writer(writer, &mut f, expected_len, path)
-}
-
 fn stream_reader_into_writer<W: Write, R: Read>(
     writer: &mut MultiFrameWriter<W>,
     f: &mut R,

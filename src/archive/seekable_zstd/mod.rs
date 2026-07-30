@@ -199,26 +199,6 @@ fn write_all_encoded<W: Write>(encoder: &mut Encoder<'_, W>, mut data: &[u8]) ->
     Ok(())
 }
 
-fn stream_file_into_encoder<W: Write>(
-    encoder: &mut Encoder<'_, W>,
-    path: &Path,
-    expected_len: u64,
-) -> Result<u64> {
-    let mut f = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if crate::util::is_skippable_fs_io(&e) => {
-            return Err(Error::Vanished(path.to_path_buf()));
-        }
-        Err(e) => {
-            return Err(Error::Archive(format!(
-                "open {} for seekable-zstd: {e}",
-                path.display()
-            )));
-        }
-    };
-    stream_reader_into_encoder(encoder, &mut f, expected_len, path)
-}
-
 fn stream_reader_into_encoder<W: Write, R: Read>(
     encoder: &mut Encoder<'_, W>,
     f: &mut R,

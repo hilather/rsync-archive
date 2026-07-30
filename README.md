@@ -284,8 +284,8 @@ Docs: [`docs/BENCH.md`](docs/BENCH.md) · published numbers: [`docs/bench/RESULT
 
 ```bash
 # Cut a release (maintainers)
-git tag -a v0.5.0 -m "v0.5.0"
-git push origin v0.5.0
+git tag -a v0.5.1 -m "v0.5.1"
+git push origin v0.5.1
 
 # Install from a release asset
 tar -xzf rsync-archive-rocky8-x86_64.tar.gz
