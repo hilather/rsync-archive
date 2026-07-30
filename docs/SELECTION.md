@@ -305,6 +305,13 @@ Automated: `tests/filter_parity.rs` (extends this table).
 
 ## Member kinds (files, symlinks, hard links)
 
+### Walk robustness
+
+Directory walks soft-skip common transient failures (`ENOENT`, `EACCES`, …) so packing
+broad trees (especially `/` or `--include-cwd` when CWD is `/`) does not abort on
+`/proc` races or unreadable dirs. On Unix, when the walk root is **not** under
+`/proc`, `/sys`, `/dev`, or `/run`, those virtual filesystems are not entered.
+
 Walk and `--files-from` select:
 
 | Kind | How | `SelectedEntry` | Size |

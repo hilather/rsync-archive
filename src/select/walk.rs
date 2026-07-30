@@ -306,15 +306,23 @@ fn walk_dir_source(
         .filter_entry(|e| should_descend(src, rules, e));
 
     for entry in walker {
-        let entry = entry.map_err(|e| {
-            Error::Selection(format!("walk error under {}: {e}", src.path.display()))
-        })?;
+        let entry = match take_walk_entry(entry, &src.path, stats)? {
+            Some(e) => e,
+            None => continue,
+        };
         let path = entry.path();
         let ft = entry.file_type();
 
         if ft.is_symlink() {
             // walkdir with follow_links(false) still yields symlink entries.
-            let archive_name = archive_name_for(src, path)?;
+            let archive_name = match archive_name_for(src, path) {
+                Ok(n) => n,
+                Err(e) => {
+                    debug!(path = %path.display(), error = %e, "skip symlink with unusable name");
+                    stats.skipped_special += 1;
+                    continue;
+                }
+            };
             consider_symlink(path, &archive_name, rules, cwd, out, stats, names)?;
             continue;
         }
@@ -327,7 +335,14 @@ fn walk_dir_source(
             continue;
         }
 
-        let archive_name = archive_name_for(src, path)?;
+        let archive_name = match archive_name_for(src, path) {
+            Ok(n) => n,
+            Err(e) => {
+                debug!(path = %path.display(), error = %e, "skip file with unusable archive name");
+                stats.skipped_special += 1;
+                continue;
+            }
+        };
         consider_file(
             path,
             &archive_name,
@@ -342,6 +357,78 @@ fn walk_dir_source(
     Ok(())
 }
 
+/// Convert a walkdir result: skip transient/inaccessible entries; hard-fail otherwise.
+///
+/// `/proc` and similar trees race (ENOENT between readdir and lstat). Permission
+/// errors on other dirs are also common when packing broad roots (e.g. `/` or CWD=`/`).
+fn take_walk_entry(
+    entry: std::result::Result<DirEntry, walkdir::Error>,
+    walk_root: &Path,
+    stats: &mut SelectionStats,
+) -> Result<Option<DirEntry>> {
+    match entry {
+        Ok(e) => Ok(Some(e)),
+        Err(e) => {
+            if is_skippable_walk_io(&e) {
+                stats.skipped_special += 1;
+                debug!(
+                    error = %e,
+                    path = ?e.path(),
+                    root = %walk_root.display(),
+                    "skip inaccessible or vanished walk entry"
+                );
+                return Ok(None);
+            }
+            Err(Error::Selection(format!(
+                "walk error under {}: {e}",
+                walk_root.display()
+            )))
+        }
+    }
+}
+
+fn is_skippable_walk_io(e: &walkdir::Error) -> bool {
+    match e.io_error() {
+        Some(ioe) => matches!(
+            ioe.kind(),
+            std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::Interrupted
+                // Linux: often returned for /proc races / weird mounts
+                | std::io::ErrorKind::InvalidInput
+        ),
+        // Loop detection etc. are not skippable.
+        None => false,
+    }
+}
+
+/// Absolute virtual-filesystem roots that are not useful archive content when
+/// walking a broader tree (e.g. `/` or `--include-cwd` from `/`).
+///
+/// If the walk root *is* one of these (user asked for `/proc` alone), we do not skip.
+fn is_virtual_fs_tree(path: &Path, walk_root: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        const VFS: &[&str] = &["/proc", "/sys", "/dev", "/run"];
+        for v in VFS {
+            let vp = Path::new(v);
+            // User explicitly selected this vfs tree as the source root.
+            if walk_root == vp || walk_root.starts_with(vp) {
+                return false;
+            }
+            if path == vp || path.starts_with(vp) {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, walk_root);
+        false
+    }
+}
+
 /// Return true if walkdir should enter this directory entry.
 fn should_descend(src: &SourceSpec, rules: &RuleSet, entry: &DirEntry) -> bool {
     if !entry.file_type().is_dir() {
@@ -351,6 +438,11 @@ fn should_descend(src: &SourceSpec, rules: &RuleSet, entry: &DirEntry) -> bool {
     // Always enter the source root.
     if path == src.path {
         return true;
+    }
+    // Skip /proc, /sys, /dev, /run when packing a broader root (not when SRC is that tree).
+    if is_virtual_fs_tree(path, &src.path) {
+        debug!(path = %path.display(), "skip virtual filesystem directory");
+        return false;
     }
     let Ok(archive_name) = dir_archive_name(src, path) else {
         // If we cannot name it, do not descend (safety).
@@ -751,6 +843,52 @@ mod tests {
         let names: Vec<_> = entries.iter().map(|e| e.archive_name.as_str()).collect();
         assert_eq!(names, vec!["keep.txt"]);
         assert!(!names.iter().any(|n| n.contains("secret")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn walk_skips_permission_denied_subdirectory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // If we cannot chmod (e.g. unusual FS), skip the test.
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("tree");
+        fs::create_dir_all(root.join("secret")).unwrap();
+        fs::write(root.join("ok.txt"), b"ok").unwrap();
+        fs::write(root.join("secret/hidden.txt"), b"nope").unwrap();
+
+        let secret = root.join("secret");
+        let mut perms = fs::metadata(&secret).unwrap().permissions();
+        perms.set_mode(0o000);
+        if fs::set_permissions(&secret, perms).is_err() {
+            return;
+        }
+        let src = SourceSpec::from_user_path(format!("{}/", root.display()).as_str()).unwrap();
+        let result = collect_from_sources(&[src], &RuleSet::new());
+        // Always restore perms so tempdir cleanup works (even if collect failed).
+        let mut perms = fs::metadata(&secret).unwrap().permissions();
+        perms.set_mode(0o755);
+        let _ = fs::set_permissions(&secret, perms);
+
+        let (entries, stats) = result.expect("walk must not hard-fail on EACCES");
+        let names: Vec<_> = entries.iter().map(|e| e.archive_name.as_str()).collect();
+        assert_eq!(names, vec!["ok.txt"]);
+        assert!(
+            stats.skipped_special >= 1,
+            "expected at least one skip for unreadable dir, got {}",
+            stats.skipped_special
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn virtual_fs_skipped_when_walking_broader_root() {
+        // /proc is skipped when walk root is not under /proc.
+        assert!(is_virtual_fs_tree(Path::new("/proc"), Path::new("/")));
+        assert!(is_virtual_fs_tree(Path::new("/proc/1"), Path::new("/")));
+        assert!(!is_virtual_fs_tree(Path::new("/proc"), Path::new("/proc")));
+        assert!(!is_virtual_fs_tree(Path::new("/proc/1"), Path::new("/proc")));
+        assert!(!is_virtual_fs_tree(Path::new("/home"), Path::new("/")));
     }
 
     #[test]

@@ -283,8 +283,8 @@ Docs: [`docs/BENCH.md`](docs/BENCH.md) · published numbers: [`docs/bench/RESULT
 
 ```bash
 # Cut a release (maintainers)
-git tag -a v0.4.0 -m "v0.4.0"
-git push origin v0.4.0
+git tag -a v0.4.1 -m "v0.4.1"
+git push origin v0.4.1
 ```
 
 Rocky builds run in official `rockylinux/rockylinux` containers. Ubuntu uses GitHub-hosted runners.

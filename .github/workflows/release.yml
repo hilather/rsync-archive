@@ -138,9 +138,9 @@ jobs:
             Multi-distro release builds (x86_64, default features).
 
             ### Highlights
+            - Walk robustness: soft-skip `/proc` races and unreadable dirs when packing broad trees
             - **`--include-cwd`**: pack process CWD at archive root (off by default; skips `-o` / `.partial`)
-            - Restriction list files: **`--file-size-from`**, **`--dir-max-size-from`**
-            - RA-friendly **tar-zstd** / **tar-lz4**; non-solid 7z default; seekable-zstd
+            - Restriction list files; RA-friendly tar-zstd/tar-lz4; non-solid 7z default
 
             ### Supported CI targets
             | Distro | Versions |
