@@ -101,10 +101,33 @@ pub fn write_tar_lz4(path: &Path, entries: &[SelectedEntry], level: u32) -> Resu
 
         let mode = e.mode;
         let mtime = e.mtime_unix.unwrap_or(0);
-        let header_offset = pos;
         let has_body = e.has_data_body();
         let data_len = if has_body { e.size } else { 0 };
 
+        let mut body_file = if has_body && data_len > 0 {
+            match File::open(&e.abs_path) {
+                Ok(f) => Some(f),
+                Err(err) if crate::util::is_skippable_fs_io(&err) => {
+                    tracing::warn!(
+                        path = %e.abs_path.display(),
+                        name = %e.archive_name,
+                        error = %err,
+                        "skip vanished or inaccessible file in tar.lz4"
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    return Err(Error::Archive(format!(
+                        "open {} for tar.lz4: {err}",
+                        e.abs_path.display()
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
+        let header_offset = pos;
         let meta = TarMemberMeta {
             size: data_len,
             mtime,
@@ -124,10 +147,8 @@ pub fn write_tar_lz4(path: &Path, entries: &[SelectedEntry], level: u32) -> Resu
             .ok_or_else(|| Error::Archive("tar offset overflow".into()))?;
 
         let data_offset = pos;
-        let written = if !has_body {
-            0u64
-        } else {
-            let n = stream_file_into_writer(&mut writer, &e.abs_path, e.size)?;
+        let written = if let Some(ref mut f) = body_file {
+            let n = stream_reader_into_writer(&mut writer, f, e.size, &e.abs_path)?;
             if n != e.size {
                 return Err(Error::Archive(format!(
                     "size changed while archiving {}: expected {}, wrote {n}",
@@ -136,6 +157,8 @@ pub fn write_tar_lz4(path: &Path, entries: &[SelectedEntry], level: u32) -> Resu
                 )));
             }
             n
+        } else {
+            0u64
         };
         pos = pos
             .checked_add(written)
@@ -309,15 +332,37 @@ fn stream_file_into_writer<W: Write>(
     if expected_len == 0 {
         return Ok(0);
     }
-    let mut f = File::open(path).map_err(|e| {
-        Error::Archive(format!("open {} for tar.lz4: {e}", path.display()))
-    })?;
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if crate::util::is_skippable_fs_io(&e) => {
+            return Err(Error::Vanished(path.to_path_buf()));
+        }
+        Err(e) => {
+            return Err(Error::Archive(format!(
+                "open {} for tar.lz4: {e}",
+                path.display()
+            )));
+        }
+    };
+    stream_reader_into_writer(writer, &mut f, expected_len, path)
+}
+
+fn stream_reader_into_writer<W: Write, R: Read>(
+    writer: &mut MultiFrameWriter<W>,
+    f: &mut R,
+    expected_len: u64,
+    path: &Path,
+) -> Result<u64> {
     let mut buf = vec![0u8; 128 * 1024];
     let mut total = 0u64;
     loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| Error::Archive(format!("read {} for tar.lz4: {e}", path.display())))?;
+        let n = f.read(&mut buf).map_err(|e| {
+            if crate::util::is_skippable_fs_io(&e) {
+                Error::Vanished(path.to_path_buf())
+            } else {
+                Error::Archive(format!("read {} for tar.lz4: {e}", path.display()))
+            }
+        })?;
         if n == 0 {
             break;
         }

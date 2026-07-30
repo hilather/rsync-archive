@@ -91,19 +91,46 @@ pub fn write_seekable_zstd(
     for e in entries {
         let name_bytes = e.archive_name.as_bytes();
         let name_len = name_bytes.len() as u64;
+        let data_len = e.size;
+
+        // Open first so vanished files skip the whole member.
+        let mut body = if data_len > 0 {
+            match File::open(&e.abs_path) {
+                Ok(f) => Some(f),
+                Err(err) if crate::util::is_skippable_fs_io(&err) => {
+                    tracing::warn!(
+                        path = %e.abs_path.display(),
+                        name = %e.archive_name,
+                        error = %err,
+                        "skip vanished or inaccessible file in seekable-zstd"
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    return Err(Error::Archive(format!(
+                        "open {} for seekable-zstd: {err}",
+                        e.abs_path.display()
+                    )));
+                }
+            }
+        } else {
+            None
+        };
 
         // Header: name_len | name | data_len
         write_all_encoded(&mut encoder, &name_len.to_le_bytes())?;
         write_all_encoded(&mut encoder, name_bytes)?;
-        // data_len known from selection; re-stat / stream for actual content.
-        let data_len = e.size;
         write_all_encoded(&mut encoder, &data_len.to_le_bytes())?;
 
         let data_offset = uncompressed_pos
             .checked_add(8 + name_len + 8)
             .ok_or_else(|| Error::Archive("uncompressed offset overflow".into()))?;
 
-        let written = stream_file_into_encoder(&mut encoder, &e.abs_path, data_len)?;
+        let written = if let Some(ref mut f) = body {
+            stream_reader_into_encoder(&mut encoder, f, data_len, &e.abs_path)?
+        } else {
+            0
+        };
         if written != data_len {
             return Err(Error::Archive(format!(
                 "size changed while archiving {}: expected {data_len}, wrote {written}",
@@ -177,14 +204,36 @@ fn stream_file_into_encoder<W: Write>(
     path: &Path,
     expected_len: u64,
 ) -> Result<u64> {
-    let mut f = File::open(path).map_err(|e| {
-        Error::Archive(format!("open {} for seekable-zstd: {e}", path.display()))
-    })?;
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if crate::util::is_skippable_fs_io(&e) => {
+            return Err(Error::Vanished(path.to_path_buf()));
+        }
+        Err(e) => {
+            return Err(Error::Archive(format!(
+                "open {} for seekable-zstd: {e}",
+                path.display()
+            )));
+        }
+    };
+    stream_reader_into_encoder(encoder, &mut f, expected_len, path)
+}
+
+fn stream_reader_into_encoder<W: Write, R: Read>(
+    encoder: &mut Encoder<'_, W>,
+    f: &mut R,
+    expected_len: u64,
+    path: &Path,
+) -> Result<u64> {
     let mut buf = vec![0u8; 128 * 1024];
     let mut total = 0u64;
     loop {
         let n = f.read(&mut buf).map_err(|e| {
-            Error::Archive(format!("read {} for seekable-zstd: {e}", path.display()))
+            if crate::util::is_skippable_fs_io(&e) {
+                Error::Vanished(path.to_path_buf())
+            } else {
+                Error::Archive(format!("read {} for seekable-zstd: {e}", path.display()))
+            }
         })?;
         if n == 0 {
             break;

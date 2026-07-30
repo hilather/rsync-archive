@@ -9,6 +9,17 @@ pub use auto_threads::{
 };
 pub use size_parse::{can_admit, parse_byte_size, DEFAULT_ENCODE_SIZE_BUDGET};
 
+/// Transient filesystem failures (ENOENT races, EACCES, …) that should not abort create.
+pub fn is_skippable_fs_io(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::InvalidInput
+    )
+}
+
 use tracing_subscriber::EnvFilter;
 
 /// Initialize stderr tracing from `-v` count and optional `RUST_LOG`.

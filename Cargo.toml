@@ -1,6 +1,6 @@
 [package]
 name = "rsync-archive"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 description = "Create non-solid 7z archives with rsync-style selection; embed finished archives under a master store 7z"
 license = "MIT"

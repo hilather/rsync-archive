@@ -88,8 +88,10 @@ rsync-archive create -o logs.tar.zst --max-total-size 100M --dir-max-files logs/
 rsync-archive create -o o.7z --files-from master.txt --file-size-from sizes.txt --dir-max-size-from dirs.txt\n  \
 rsync-archive create -o pack.7z --include-cwd -n   # CWD files at archive root; skip pack.7z\n  \
 rsync-archive create -o pack.tlz4 -n ./tree/   # dry-run; .tlz4 → tar-lz4\n  \
-rsync-archive create -o o.7z --exclude '*.tmp' --newer-than 7d ./src/\n\n\
-See docs/SELECTION.md for list-file formats and filter semantics; docs/FORMAT_TAR_*.md for tar layouts."
+rsync-archive create -o o.7z --exclude '*.tmp' --newer-than 7d ./src/\n  \
+rsync-archive create -n -o o.7z --filter-from rules.txt ./src/   # ordered +/- file\n\n\
+Filters: use --filter / --filter-from for ordered mixes; --include then --exclude are batched \
+(not CLI-interleaved). See docs/SELECTION.md and docs/RSYNC_PARITY.md."
 )]
 pub struct CreateArgs {
     /// Output path (`.7z`, `.zst`, `.tar.zst`/`.tzst`, `.tar.lz4`/`.tlz4`).
@@ -117,20 +119,34 @@ pub struct CreateArgs {
     pub force: bool,
 
     /// Exclude pattern (rsync-style; repeatable; basename match if no `/`).
+    ///
+    /// All `--include` patterns are applied as a batch **before** all `--exclude`
+    /// patterns (clap does not interleave heterogeneous flags). Prefer `--filter` or
+    /// `--filter-from` when rule order must mix include and exclude.
     #[arg(long = "exclude", value_name = "PATTERN", action = clap::ArgAction::Append)]
     pub exclude: Vec<String>,
 
     /// Include pattern (rsync-style; repeatable).
+    ///
+    /// Batched before all `--exclude` (not interleaved with them). Prefer `--filter`
+    /// / `--filter-from` for rsync-style ordered mixes (e.g. exclude-all then include).
     #[arg(long = "include", value_name = "PATTERN", action = clap::ArgAction::Append)]
     pub include: Vec<String>,
 
-    /// Exclude patterns from file (one per line; `#` comments).
-    #[arg(long = "exclude-from", value_name = "FILE")]
-    pub exclude_from: Option<PathBuf>,
+    /// Exclude patterns from file (one per line; `#` comments; repeatable).
+    ///
+    /// Bare lines default to exclude; `+`/`-`/`include`/`exclude` prefixes override.
+    /// Multiple files load in CLI order. Rule build order: include-from → exclude-from
+    /// → filter-from → filter → include → exclude.
+    #[arg(long = "exclude-from", value_name = "FILE", action = clap::ArgAction::Append)]
+    pub exclude_from: Vec<PathBuf>,
 
-    /// Include patterns from file (one per line; `#` comments).
-    #[arg(long = "include-from", value_name = "FILE")]
-    pub include_from: Option<PathBuf>,
+    /// Include patterns from file (one per line; `#` comments; repeatable).
+    ///
+    /// Bare lines default to include; `+`/`-`/`include`/`exclude` prefixes override.
+    /// Multiple files load in CLI order (all include-from before all exclude-from).
+    #[arg(long = "include-from", value_name = "FILE", action = clap::ArgAction::Append)]
+    pub include_from: Vec<PathBuf>,
 
     /// Explicit path list (exclusive of SRC...; relative to CWD unless absolute).
     #[arg(long = "files-from", value_name = "FILE")]
@@ -143,7 +159,18 @@ pub struct CreateArgs {
     #[arg(long = "include-cwd", default_value_t = false)]
     pub include_cwd: bool,
 
-    /// Filter rule such as `+ *.rs` or `- *.tmp` (repeatable; ordered).
+    /// Ordered filter rules from file (`+`/`-`/`include`/`exclude` lines; repeatable).
+    ///
+    /// Best rsync-like path for a full ordered rule list (analogue of merge-file without
+    /// dir-merge). Multiple files append in CLI order. Loaded after include-from/exclude-from
+    /// and before CLI `--filter`.
+    #[arg(long = "filter-from", value_name = "FILE", action = clap::ArgAction::Append)]
+    pub filter_from: Vec<PathBuf>,
+
+    /// Filter rule such as `+ *.rs` or `- *.tmp` (repeatable; CLI order preserved).
+    ///
+    /// Prefer this or `--filter-from` when include/exclude must interleave; `--include`
+    /// and `--exclude` are batched separately.
     #[arg(long = "filter", value_name = "RULE", action = clap::ArgAction::Append)]
     pub filter: Vec<String>,
 
@@ -396,10 +423,11 @@ mod tests {
             force: false,
             exclude: vec![],
             include: vec![],
-            exclude_from: None,
-            include_from: None,
+            exclude_from: vec![],
+            include_from: vec![],
             files_from: None,
             include_cwd: false,
+            filter_from: vec![],
             filter: vec![],
             level: 5,
             method: "zstd".into(),

@@ -21,7 +21,7 @@ use crate::select::dir_budget::{
     apply_dir_budgets, apply_dir_file_limits, collect_dir_budgets, collect_dir_file_limits,
     RestrictionReport,
 };
-use crate::select::from_file::{load_exclude_from, load_include_from};
+use crate::select::from_file::{load_exclude_from, load_filter_from, load_include_from};
 use crate::select::global_restrict::{
     apply_max_files, apply_max_total_size, apply_per_file_limits, per_file_limits_from_cli,
 };
@@ -46,21 +46,26 @@ use tracing::{debug, info, warn};
 /// Build the ordered filter set from create CLI flags.
 ///
 /// **Rule order (v1):**
-/// 1. `--include-from` (file line order)
-/// 2. `--exclude-from` (file line order)
-/// 3. `--filter` (CLI order)
-/// 4. `--include` (CLI order among includes)
-/// 5. `--exclude` (CLI order among excludes)
+/// 1. `--include-from` (each file in CLI order; line order within file)
+/// 2. `--exclude-from` (each file in CLI order; line order within file)
+/// 3. `--filter-from` (each file in CLI order; ordered `+/-` lines)
+/// 4. `--filter` (CLI order among filters)
+/// 5. `--include` (CLI order among includes)
+/// 6. `--exclude` (CLI order among excludes)
 ///
 /// Clap does not preserve interleaving of different long options. For strict
-/// rsync-style interleaving of include/exclude, use repeated `--filter`.
+/// rsync-style ordered mixes, put all rules in `--filter-from` and/or repeated
+/// `--filter` (not mixed `--include` / `--exclude` order).
 pub fn build_rules(args: &CreateArgs) -> Result<RuleSet> {
     let mut rules = RuleSet::new();
-    if let Some(path) = &args.include_from {
+    for path in &args.include_from {
         load_include_from(&mut rules, path)?;
     }
-    if let Some(path) = &args.exclude_from {
+    for path in &args.exclude_from {
         load_exclude_from(&mut rules, path)?;
+    }
+    for path in &args.filter_from {
+        load_filter_from(&mut rules, path)?;
     }
     for line in &args.filter {
         rules.push_filter_line(line)?;
@@ -628,28 +633,37 @@ fn encode_one(
     entry: &SelectedEntry,
     level: u32,
     method: CompressMethod,
-) -> Result<PreparedMember> {
+) -> Result<Option<PreparedMember>> {
     // OPT-03: use selection-time size/mtime; no re-stat.
     let mtime = entry.mtime_unix.map(filetime_from_unix_secs);
 
     if entry.size == 0 {
-        return Ok(PreparedMember {
+        return Ok(Some(PreparedMember {
             name: entry.archive_name.clone(),
             mtime,
             empty: true,
             compressed: None,
-        });
+        }));
     }
 
     // File-level workers: no extra zstd nbWorkers (avoid oversubscription).
-    let compressed =
-        compress_path_with_size(&entry.abs_path, method, level, Some(entry.size), 0)?;
-    Ok(PreparedMember {
-        name: entry.archive_name.clone(),
-        mtime,
-        empty: false,
-        compressed: Some(compressed),
-    })
+    match compress_path_with_size(&entry.abs_path, method, level, Some(entry.size), 0) {
+        Ok(compressed) => Ok(Some(PreparedMember {
+            name: entry.archive_name.clone(),
+            mtime,
+            empty: false,
+            compressed: Some(compressed),
+        })),
+        Err(Error::Vanished(p)) => {
+            warn!(
+                path = %p.display(),
+                name = %entry.archive_name,
+                "skip vanished file at encode"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 struct Job {
@@ -683,7 +697,7 @@ fn write_create_parallel(
         q: Mutex::new(VecDeque::new()),
         cvar: Condvar::new(),
     });
-    let (res_tx, res_rx) = mpsc::channel::<(usize, u64, Result<PreparedMember>)>();
+    let (res_tx, res_rx) = mpsc::channel::<(usize, u64, Result<Option<PreparedMember>>)>();
     let panic_flag = Arc::new(AtomicBool::new(false));
 
     thread::scope(|scope| -> Result<()> {
@@ -726,7 +740,8 @@ fn write_create_parallel(
             let mut next_write = 0usize;
             let mut running_sum = 0u64;
             let mut running_count = 0usize;
-            let mut pending: BTreeMap<usize, PreparedMember> = BTreeMap::new();
+            // None = vanished/skipped at encode; still advances write order.
+            let mut pending: BTreeMap<usize, Option<PreparedMember>> = BTreeMap::new();
 
             while next_write < n {
                 if panic_flag.load(Ordering::SeqCst) {
@@ -779,22 +794,24 @@ fn write_create_parallel(
                 pending.insert(idx, prepared);
 
                 // OPT-02: stream write in order as soon as next index is ready.
-                while let Some(p) = pending.remove(&next_write) {
-                    if p.empty {
-                        writer.push_packed_with_mtime(
-                            p.name,
-                            CompressedPack {
-                                data: vec![],
-                                method_id: vec![0x00],
-                                method_props: vec![],
-                                crc32: 0,
-                                uncompressed_size: 0,
-                                pack_crc: 0,
-                            },
-                            p.mtime,
-                        )?;
-                    } else if let Some(c) = p.compressed {
-                        writer.push_packed_with_mtime(p.name, c, p.mtime)?;
+                while let Some(opt) = pending.remove(&next_write) {
+                    if let Some(p) = opt {
+                        if p.empty {
+                            writer.push_packed_with_mtime(
+                                p.name,
+                                CompressedPack {
+                                    data: vec![],
+                                    method_id: vec![0x00],
+                                    method_props: vec![],
+                                    crc32: 0,
+                                    uncompressed_size: 0,
+                                    pack_crc: 0,
+                                },
+                                p.mtime,
+                            )?;
+                        } else if let Some(c) = p.compressed {
+                            writer.push_packed_with_mtime(p.name, c, p.mtime)?;
+                        }
                     }
                     next_write += 1;
                 }
@@ -920,10 +937,11 @@ pub(crate) fn test_create_args(
         force: false,
         exclude: vec![],
         include: vec![],
-        exclude_from: None,
-        include_from: None,
+        exclude_from: vec![],
+        include_from: vec![],
         files_from: None,
         include_cwd: false,
+        filter_from: vec![],
         filter: vec![],
         level: 5,
         method: "lzma2".into(),
@@ -989,6 +1007,53 @@ mod tests {
             rules.action_for("a.o", false),
             crate::select::RuleAction::Exclude
         );
+    }
+
+    #[test]
+    fn build_rules_filter_from_order() {
+        let dir = tempdir().unwrap();
+        let ff = dir.path().join("rules.txt");
+        fs::write(&ff, "+ /data/\n+ /data/**\n- *\n").unwrap();
+        let mut args = test_create_args(dir.path().join("o.7z"), vec![]);
+        args.filter_from.push(ff);
+        let rules = build_rules(&args).unwrap();
+        assert_eq!(rules.len(), 3);
+        assert_eq!(
+            rules.action_for("data/file.txt", false),
+            crate::select::RuleAction::Include
+        );
+        assert_eq!(
+            rules.action_for("other/x", false),
+            crate::select::RuleAction::Exclude
+        );
+    }
+
+    #[test]
+    fn build_rules_multiple_from_files_order() {
+        let dir = tempdir().unwrap();
+        let inc = dir.path().join("inc.txt");
+        let exc = dir.path().join("exc.txt");
+        let filt = dir.path().join("filt.txt");
+        fs::write(&inc, "*.c\n").unwrap();
+        fs::write(&exc, "*.o\n").unwrap();
+        // filter-from after include-from/exclude-from: can still exclude *.c via later rule
+        fs::write(&filt, "- *.c\n").unwrap();
+        let mut args = test_create_args(dir.path().join("o.7z"), vec![]);
+        args.include_from.push(inc);
+        args.exclude_from.push(exc);
+        args.filter_from.push(filt);
+        let rules = build_rules(&args).unwrap();
+        // include *.c, exclude *.o, filter - *.c → first match for a.c is Include from include-from
+        assert_eq!(
+            rules.action_for("a.c", false),
+            crate::select::RuleAction::Include
+        );
+        assert_eq!(
+            rules.action_for("a.o", false),
+            crate::select::RuleAction::Exclude
+        );
+        // filter-from rule is third; never reached for *.c due to first-match include
+        assert_eq!(rules.len(), 3);
     }
 
     #[test]

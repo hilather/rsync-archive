@@ -143,7 +143,7 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | Hard links | **Unix:** first `(dev,ino)` path is full file; later → `HardLink` (size 0). **tar-zstd / tar-lz4:** typeflag `'1'` (linkname = first archive path). **7z / seekable-zstd:** skip hard-link members (keep first file). Non-Unix: no detection. |
 | `--files-from` | Exclusive of `SRC...`; paths relative to **CWD** unless absolute |
 | `--include-cwd` | **Off** by default; when on, pack CWD at archive root; skip `-o` and `.partial` |
-| Patterns without `/` | Match **basename** (e.g. `*.tmp` matches `dir/a.tmp`) |
+| Patterns without `/` (and without `**`) | Match **basename** (e.g. `*.tmp` matches `dir/a.tmp`); unanchored multi-segment end-anchored; prefer `--filter-from` for ordered mixes |
 | Streaming | Peak RAM O(dict + I/O buffers), not O(file size) for create |
 
 ---

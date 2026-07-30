@@ -160,15 +160,33 @@ pub fn compress_path_with_size(
     // Small-file fast path: one read + bulk compress.
     if let Some(sz) = size {
         if sz > 0 && sz <= SMALL_FILE_ONESHOT {
-            let data = std::fs::read(path).map_err(|e| {
-                Error::Archive(format!("read {} for compress: {e}", path.display()))
-            })?;
+            let data = match std::fs::read(path) {
+                Ok(d) => d,
+                Err(e) if crate::util::is_skippable_fs_io(&e) => {
+                    return Err(Error::Vanished(path.to_path_buf()));
+                }
+                Err(e) => {
+                    return Err(Error::Archive(format!(
+                        "read {} for compress: {e}",
+                        path.display()
+                    )));
+                }
+            };
             return compress_bytes_inner(&data, method, level, zstd_nb_workers);
         }
     }
-    let mut f = std::fs::File::open(path).map_err(|e| {
-        Error::Archive(format!("open {} for compress: {e}", path.display()))
-    })?;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if crate::util::is_skippable_fs_io(&e) => {
+            return Err(Error::Vanished(path.to_path_buf()));
+        }
+        Err(e) => {
+            return Err(Error::Archive(format!(
+                "open {} for compress: {e}",
+                path.display()
+            )));
+        }
+    };
     compress_reader_sized(&mut f, method, level, size, zstd_nb_workers)
 }
 

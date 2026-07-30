@@ -45,6 +45,7 @@ fn create_help_shows_key_flags() {
         .stdout(predicate::str::contains("--dry-run"))
         .stdout(predicate::str::contains("--force"))
         .stdout(predicate::str::contains("--exclude"))
+        .stdout(predicate::str::contains("--filter-from"))
         .stdout(predicate::str::contains("--files-from"))
         .stdout(predicate::str::contains("--include-cwd"))
         .stdout(predicate::str::contains("--level"))
@@ -159,6 +160,44 @@ fn create_dry_run_lists_files() {
 }
 
 #[test]
+fn create_dry_run_filter_from_tree_include() {
+    use std::fs;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("tree");
+    fs::create_dir_all(root.join("data/elasticsearch")).unwrap();
+    fs::create_dir_all(root.join("other")).unwrap();
+    fs::write(root.join("data/file.txt"), b"d").unwrap();
+    fs::write(root.join("data/elasticsearch/x"), b"e").unwrap();
+    fs::write(root.join("other/x"), b"k").unwrap();
+
+    let rules = dir.path().join("rules.txt");
+    fs::write(
+        &rules,
+        "+ /data/\n+ /data/**\n- *\n",
+    )
+    .unwrap();
+
+    let src = format!("{}/", root.display());
+    bin()
+        .args([
+            "create",
+            "-o",
+            dir.path().join("out.7z").to_str().unwrap(),
+            "-n",
+            "--filter-from",
+            rules.to_str().unwrap(),
+            &src,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("data/file.txt"))
+        .stdout(predicate::str::contains("data/elasticsearch/x"))
+        .stdout(predicate::str::contains("other/x").not());
+}
+
+#[test]
 fn embed_missing_input_exits_1() {
     bin()
         .args(["embed", "-o", "master.7z", "a.7z"])
@@ -207,10 +246,11 @@ fn create_validate_unit_rejects_both_modes() {
         force: false,
         exclude: vec![],
         include: vec![],
-        exclude_from: None,
-        include_from: None,
+        exclude_from: vec![],
+        include_from: vec![],
         files_from: Some(PathBuf::from("list.txt")),
         include_cwd: false,
+        filter_from: vec![],
         filter: vec![],
         level: 5,
         method: "lzma2".into(),
@@ -245,10 +285,11 @@ fn create_validate_unit_accepts_sources_only() {
         force: false,
         exclude: vec![],
         include: vec![],
-        exclude_from: None,
-        include_from: None,
+        exclude_from: vec![],
+        include_from: vec![],
         files_from: None,
         include_cwd: false,
+        filter_from: vec![],
         filter: vec![],
         level: 5,
         method: "lzma2".into(),

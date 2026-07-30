@@ -24,9 +24,11 @@ pub struct Rule {
 }
 
 impl Rule {
-    /// Patterns with no `/` match the basename only (K27).
+    /// Patterns with no `/` and no `**` match the basename only (K27 / rsync).
+    ///
+    /// Presence of `**` forces full-path matching even without `/` (e.g. bare `**`).
     pub fn basename_mode(&self) -> bool {
-        !self.pattern.contains('/')
+        !self.pattern.contains('/') && !self.pattern.contains("**")
     }
 }
 
@@ -238,6 +240,14 @@ mod tests {
     fn parse_full_path_pattern() {
         let r = parse_rule(RuleAction::Exclude, "dir/*").unwrap();
         assert_eq!(r.pattern, "dir/*");
+        assert!(!r.basename_mode());
+        assert!(!r.anchored);
+    }
+
+    #[test]
+    fn bare_double_star_not_basename_mode() {
+        let r = parse_rule(RuleAction::Exclude, "**").unwrap();
+        assert_eq!(r.pattern, "**");
         assert!(!r.basename_mode());
         assert!(!r.anchored);
     }

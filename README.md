@@ -112,7 +112,7 @@ Default create remains **non-solid 7z** with **`--method lzma2`**.
 **`--files-from`:** exclusive of `SRC...`; relative lines keep path as member name; absolute lines use basename.  
 **`--include-cwd`:** (off by default) also pack files under the process CWD at **archive root** (like a trailing `/` on `.`); skips the `-o` output and its `.partial` temp. May be used alone or with `SRC...` / `--files-from`.  
 
-**Filters:** see [`docs/SELECTION.md`](docs/SELECTION.md). Rule build order: include-from → exclude-from → `--filter` → `--include` → `--exclude` (use `--filter` for strict interleaving).  
+**Filters:** see [`docs/SELECTION.md`](docs/SELECTION.md) and [`docs/RSYNC_PARITY.md`](docs/RSYNC_PARITY.md). Rule build order: `include-from` → `exclude-from` → **`filter-from`** → `--filter` → `--include` → `--exclude`. Prefer **`--filter-from`** / `--filter` for ordered mixes (`--include`/`--exclude` are batched, not CLI-interleaved).  
 **Restriction list files** (only matching paths/prefixes; others ignore that list):  
 - **`--file-size-from`:** rsync-like `PATTERN max=SIZE` (no min; first match wins).  
 - **`--dir-max-size-from`:** `DIR/ max=SIZE` and optional `files=N`, or legacy `DIR/=SIZE`.  
@@ -150,13 +150,14 @@ Default naming flattens to **basename**. Missing 7z magic **warns** (stderr log)
 | `--format` / `--output-format` | infer / `7z` | `7z` · `seekable-zstd` (`.zst`) · `tar-zstd` (`.tar.zst` / `.tzst`) · `tar-lz4` (`.tar.lz4` / `.tlz4`) |
 | `-n`, `--dry-run` | off | List selection only |
 | `--force` | off | Overwrite existing `-o` |
-| `--exclude` / `--include` | — | Rsync-style patterns (repeatable) |
-| `--exclude-from` / `--include-from` | — | Pattern files |
+| `--exclude` / `--include` | — | Rsync-style patterns (repeatable; include batch then exclude batch) |
+| `--exclude-from` / `--include-from` | — | Pattern files (repeatable) |
+| `--filter-from` | — | Ordered `+/-` filter file (repeatable; preferred for full rule lists) |
 | `--files-from` | — | Master collect list (exclusive of `SRC...`) |
 | `--include-cwd` | off | Pack CWD files at archive root; skip `-o` / `.partial` |
 | `--file-size-from` | — | Per-path max size list (`PATTERN max=SIZE`; only matches) |
 | `--dir-max-size-from` | — | Dir size/count list (`DIR/ max=SIZE [files=N]`) |
-| `--filter` | — | `+ pattern` / `- pattern` (repeatable) |
+| `--filter` | — | `+ pattern` / `- pattern` (repeatable; CLI order among filters) |
 | `--level` | `5` | Level 0–9 (LZMA2 preset / mapped Zstd; LZ4 1–2 fast, ≥3 HC with `--features lz4-hc`) |
 | `--method` | `lzma2` | **7z only:** `lzma2` · `zstd` · `lz4` (non-solid per-file packs) |
 | `--verify` | off | Post-write: non-solid + member count + sample extract (7z); index/member check (seekable-zstd / tar-zstd / tar-lz4) |
@@ -251,7 +252,7 @@ tests/                    # cli_smoke, e2e_create, e2e_create_dry_run, e2e_large
 Rsync-style include/exclude + walk + post-filter restrictions:
 
 - Ordered first-match-wins; default **Include** if no rule matches
-- `--include` / `--exclude` / `--filter '+|-'` / include-from / exclude-from
+- `--include` / `--exclude` / `--filter '+|-'` / `--filter-from` / include-from / exclude-from (repeatable from-files)
 - Basename match when pattern has no `/` (`*.tmp` matches `dir/a.tmp`) — K27
 - Anchored `/pat`, dir-only `pat/`, wildcards `*` `**` `?`
 - Dir prune during walk; filter files capped at **10 MiB** / **1M lines**
@@ -283,8 +284,8 @@ Docs: [`docs/BENCH.md`](docs/BENCH.md) · published numbers: [`docs/bench/RESULT
 
 ```bash
 # Cut a release (maintainers)
-git tag -a v0.4.2 -m "v0.4.2"
-git push origin v0.4.2
+git tag -a v0.5.0 -m "v0.5.0"
+git push origin v0.5.0
 
 # Install from a release asset
 tar -xzf rsync-archive-rocky8-x86_64.tar.gz

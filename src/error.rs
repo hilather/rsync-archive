@@ -57,6 +57,10 @@ pub enum Error {
 
     #[error("compression error: {0}")]
     Compress(String),
+
+    /// Source vanished or became inaccessible between selection and open (soft-skipped by create).
+    #[error("vanished: {0}")]
+    Vanished(PathBuf),
 }
 
 /// Convenient result alias.

@@ -31,6 +31,7 @@ use super::walk::{SelectedEntry, SelectionStats};
 use crate::error::{Error, Result};
 use crate::util::parse_byte_size;
 use std::path::Path;
+use tracing::warn;
 
 /// One file-size restriction: rsync-style pattern + max size.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +45,7 @@ pub struct FileSizeRule {
 ///
 /// Token order is flexible (`max=SIZE` may appear before or after the pattern).
 /// Exactly one `max=` field is required. No `min=` (not supported).
+/// Invalid lines are soft-skipped by loaders (see [`load_file_size_from`]).
 pub fn parse_file_size_line(line: &str) -> Result<FileSizeRule> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
@@ -66,9 +68,6 @@ pub fn parse_file_size_line(line: &str) -> Result<FileSizeRule> {
                 return Err(Error::Message(format!(
                     "invalid file-size line '{line}': duplicate max="
                 )));
-            }
-            if tok.starts_with("min=") || rest.contains("min=") {
-                // defensive; min not supported as separate token below
             }
             max_size = Some(parse_byte_size(rest).map_err(|e| {
                 Error::Message(format!("invalid file-size line '{line}': {e}"))
@@ -97,12 +96,13 @@ pub fn parse_file_size_line(line: &str) -> Result<FileSizeRule> {
         )));
     }
     let pat = pattern_parts.join(" ");
-    // Match as include rule (action unused for size apply; only pattern match).
     let rule = parse_rule(RuleAction::Include, &pat)?;
     Ok(FileSizeRule { rule, max_size })
 }
 
 /// Load `--file-size-from FILE` (ordered; first match wins at apply time).
+///
+/// **Invalid lines are logged and ignored** (create continues). Blank/`#` lines skip.
 pub fn load_file_size_from(path: &Path) -> Result<Vec<FileSizeRule>> {
     let lines = read_capped_lines(path)?;
     let mut out = Vec::new();
@@ -111,10 +111,18 @@ pub fn load_file_size_from(path: &Path) -> Result<Vec<FileSizeRule>> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let rule = parse_file_size_line(trimmed).map_err(|e| {
-            Error::Selection(format!("{}:{}: {e}", path.display(), idx + 1))
-        })?;
-        out.push(rule);
+        match parse_file_size_line(trimmed) {
+            Ok(rule) => out.push(rule),
+            Err(e) => {
+                warn!(
+                    file = %path.display(),
+                    line = idx + 1,
+                    error = %e,
+                    text = %trimmed,
+                    "ignoring invalid --file-size-from line"
+                );
+            }
+        }
     }
     Ok(out)
 }
@@ -277,8 +285,8 @@ pub fn parse_dir_restrict_line(line: &str) -> Result<DirRestrictLine> {
 
 /// Load `--dir-max-size-from FILE` into size budgets and optional file-count limits.
 ///
-/// Duplicate size prefixes or file-count prefixes (against `budgets` / `file_limits`
-/// or within the file) error.
+/// **Invalid lines are logged and ignored.** Duplicate prefixes against existing
+/// CLI/file entries are also logged and ignored (line skipped).
 pub fn load_dir_max_size_from(
     path: &Path,
     budgets: &mut Vec<DirBudget>,
@@ -290,42 +298,56 @@ pub fn load_dir_max_size_from(
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let parsed = parse_dir_restrict_line(trimmed).map_err(|e| {
-            Error::Selection(format!("{}:{}: {e}", path.display(), idx + 1))
-        })?;
+        let parsed = match parse_dir_restrict_line(trimmed) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    file = %path.display(),
+                    line = idx + 1,
+                    error = %e,
+                    text = %trimmed,
+                    "ignoring invalid --dir-max-size-from line"
+                );
+                continue;
+            }
+        };
         if let Some(limit) = parsed.max_size {
             if budgets.iter().any(|b| b.prefix == parsed.prefix) {
-                return Err(Error::Message(format!(
-                    "{}:{}: duplicate dir-max-size for directory '{}'",
-                    path.display(),
-                    idx + 1,
-                    parsed.prefix
-                )));
+                warn!(
+                    file = %path.display(),
+                    line = idx + 1,
+                    prefix = %parsed.prefix,
+                    "ignoring duplicate dir-max-size prefix"
+                );
+            } else {
+                budgets.push(DirBudget {
+                    prefix: parsed.prefix.clone(),
+                    limit,
+                });
             }
-            budgets.push(DirBudget {
-                prefix: parsed.prefix.clone(),
-                limit,
-            });
         }
         if let Some(max_count) = parsed.max_files {
             if file_limits.iter().any(|f| f.prefix == parsed.prefix) {
-                return Err(Error::Message(format!(
-                    "{}:{}: duplicate dir-max-files for directory '{}'",
-                    path.display(),
-                    idx + 1,
-                    parsed.prefix
-                )));
+                warn!(
+                    file = %path.display(),
+                    line = idx + 1,
+                    prefix = %parsed.prefix,
+                    "ignoring duplicate dir-max-files prefix"
+                );
+            } else {
+                file_limits.push(DirFileLimit {
+                    prefix: parsed.prefix,
+                    max_count,
+                });
             }
-            file_limits.push(DirFileLimit {
-                prefix: parsed.prefix,
-                max_count,
-            });
         }
     }
     Ok(())
 }
 
 /// Load `--dir-max-files-from` accepting legacy `PATH=N` **or** `PATH/ files=N`.
+///
+/// **Invalid lines are logged and ignored.**
 pub fn load_dir_max_files_from_ext(
     path: &Path,
     existing: &mut Vec<DirFileLimit>,
@@ -336,16 +358,27 @@ pub fn load_dir_max_files_from_ext(
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let lim = parse_dir_file_limit_line(trimmed).map_err(|e| {
-            Error::Selection(format!("{}:{}: {e}", path.display(), idx + 1))
-        })?;
+        let lim = match parse_dir_file_limit_line(trimmed) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(
+                    file = %path.display(),
+                    line = idx + 1,
+                    error = %e,
+                    text = %trimmed,
+                    "ignoring invalid --dir-max-files-from line"
+                );
+                continue;
+            }
+        };
         if existing.iter().any(|x| x.prefix == lim.prefix) {
-            return Err(Error::Message(format!(
-                "{}:{}: duplicate --dir-max-files for directory '{}'",
-                path.display(),
-                idx + 1,
-                lim.prefix
-            )));
+            warn!(
+                file = %path.display(),
+                line = idx + 1,
+                prefix = %lim.prefix,
+                "ignoring duplicate --dir-max-files prefix"
+            );
+            continue;
         }
         existing.push(lim);
     }
@@ -413,6 +446,27 @@ mod tests {
     #[test]
     fn parse_file_size_rejects_min() {
         assert!(parse_file_size_line("a max=1M min=1K").is_err());
+    }
+
+    #[test]
+    fn load_file_size_from_ignores_invalid_lines() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("sizes.txt");
+        fs::write(
+            &f,
+            "# comment\n\
+             **/*.log max=10\n\
+             max=8192P-1\n\
+             not-a-valid-line\n\
+             core max=1K\n",
+        )
+        .unwrap();
+        let rules = load_file_size_from(&f).expect("load must not fail on bad lines");
+        assert_eq!(rules.len(), 2);
+        assert!(path_matches_rule(&rules[0].rule, "a.log", false));
+        assert_eq!(rules[0].max_size, 10);
+        assert!(path_matches_rule(&rules[1].rule, "core", false));
+        assert_eq!(rules[1].max_size, 1024);
     }
 
     #[test]

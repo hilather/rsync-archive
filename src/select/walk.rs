@@ -8,6 +8,7 @@ use super::pathnorm::{basename_utf8, normalize_archive_str};
 use super::rules::{RuleAction, RuleSet};
 use super::{archive_name_for, SourceKind, SourceSpec};
 use crate::error::{Error, Result};
+use crate::util::is_skippable_fs_io;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::debug;
@@ -393,18 +394,6 @@ fn is_skippable_walk_io(e: &walkdir::Error) -> bool {
         // Loop detection etc. are not skippable.
         None => false,
     }
-}
-
-/// Transient FS failures that should not abort selection (races under `/tmp`, `/proc`, …).
-fn is_skippable_fs_io(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::NotFound
-            | std::io::ErrorKind::PermissionDenied
-            | std::io::ErrorKind::Interrupted
-            // Linux: often returned for /proc races / weird mounts
-            | std::io::ErrorKind::InvalidInput
-    )
 }
 
 /// Absolute virtual-filesystem roots that are not useful archive content when

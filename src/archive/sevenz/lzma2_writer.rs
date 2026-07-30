@@ -72,9 +72,24 @@ impl NonsolidLzma2Writer {
             return Ok(());
         }
 
-        let mut input = File::open(&entry.abs_path).map_err(|e| {
-            Error::Archive(format!("open {}: {e}", entry.abs_path.display()))
-        })?;
+        let mut input = match File::open(&entry.abs_path) {
+            Ok(f) => f,
+            Err(e) if crate::util::is_skippable_fs_io(&e) => {
+                tracing::warn!(
+                    path = %entry.abs_path.display(),
+                    name = %entry.archive_name,
+                    error = %e,
+                    "skip vanished or inaccessible file at open"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(Error::Archive(format!(
+                    "open {}: {e}",
+                    entry.abs_path.display()
+                )));
+            }
+        };
         let zstd_w = if self.method == CompressMethod::Zstd {
             self.zstd_nb_workers
         } else {

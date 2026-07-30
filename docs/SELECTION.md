@@ -14,15 +14,18 @@ Related: [`DESIGN.md`](DESIGN.md) (K26, K27, prune algorithm), [`README.md`](../
 |---------|----|
 | `--exclude=PATTERN` | Yes |
 | `--include=PATTERN` | Yes |
-| `--exclude-from=FILE` | Yes |
-| `--include-from=FILE` | Yes |
+| `--exclude-from=FILE` | Yes (repeatable) |
+| `--include-from=FILE` | Yes (repeatable) |
+| `--filter-from=FILE` | Yes (repeatable; ordered `+/-` lines) |
 | `--filter='+ …'` / `- …` | Yes (basic) |
 | Patterns `*`, `**`, `?` | Yes |
 | Anchored `/pattern` | Yes |
 | Directory-only `pattern/` | Yes |
+| Unanchored multi-segment end-anchor | Yes (`foo/bar` matches `a/foo/bar`) |
+| Bare `**` full-path match | Yes |
 | First-match-wins | Yes |
 | Default if no rule matches | **Include** |
-| Include-only idiom | `--include='*.c' --exclude='*'` (order matters) |
+| Include-only idiom | `--include='*.c' --exclude='*'` (works via batch order) or `--filter` / `--filter-from` |
 | Filter/from file size cap | **10 MiB** or **1_000_000 lines** per file |
 | `--files-from` list reading | Line/caps helper present; full mode Stage 5 |
 
@@ -58,7 +61,39 @@ Rules are **ordered**. Evaluation:
 2. **First match wins** → that rule’s action (`Include` or `Exclude`).
 3. If **no** rule matches → **Include**.
 
-CLI / API build order is append order:
+**Directory rules (trailing `/`):**
+- **Exclude** `foo/` matches the directory and all files under it.
+- **Include** `foo/` matches **only the directory itself** (so walk may enter it). It does
+  **not** include every file under `foo/`. To pack a whole tree with an exclude-all default:
+
+```text
++ /data/
++ /data/**
+- *
+```
+
+With only `+ /data/` and `- *`, files under `data/` (e.g. `data/elasticsearch/...`) are
+**excluded** by `- *` (rsync-aligned).
+
+### CLI `build_rules` order (create)
+
+Clap stores each flag type in its own list, so **heterogeneous flags are not
+interleaved by command-line position**. Fixed buckets (implementation:
+`src/pipeline/create.rs` → `build_rules`):
+
+```text
+1. --include-from FILE…   (each file in CLI order; line order within file)
+2. --exclude-from FILE…   (each file in CLI order; line order within file)
+3. --filter-from FILE…    (each file in CLI order; every line must be +/- or include/exclude)
+4. --filter RULE…         (CLI order among --filter only)
+5. --include PATTERN…     (all includes, CLI order among includes)
+6. --exclude PATTERN…     (all excludes, CLI order among excludes)
+```
+
+**Prefer `--filter-from` (or repeated `--filter`)** for rsync-like ordered rule
+lists. Example: `--exclude='*' --include='*.c'` is rewritten as include-then-exclude
+(keeps `*.c`); to exclude everything first use `--filter='- *' --filter='+ *.c'` or a
+`--filter-from` file with those lines in order.
 
 | Source | Action for bare pattern |
 |--------|-------------------------|
@@ -67,9 +102,12 @@ CLI / API build order is append order:
 | `--filter '+ PAT'` | Include |
 | `--filter '- PAT'` | Exclude |
 | `--filter 'include PAT'` / `'exclude PAT'` | Include / Exclude (long form) |
+| `--filter-from` line | Must have `+`/`-`/`include`/`exclude` (no bare default) |
 | `--exclude-from` bare line | Exclude |
 | `--include-from` bare line | Include |
 | from-file line with `+`/`-`/`include`/`exclude` prefix | Explicit action (overrides file default) |
+
+Related audit: [`RSYNC_PARITY.md`](RSYNC_PARITY.md).
 
 ### Filter line syntax
 
@@ -117,8 +155,9 @@ For a raw pattern string `pat`:
 
 Stored fields: `action`, `pattern` (stripped), `anchored`, `dir_only`.
 
-**Basename mode (K27):** if the stored `pattern` contains **no** `/`, matching uses
-the path’s **basename** only; otherwise the **full** relative path.
+**Basename mode (K27):** if the stored `pattern` contains **no** `/` and **no**
+`**`, matching uses the path’s **basename** only; otherwise the **full** relative
+path. Bare `**` is full-path mode (matches any path).
 
 Examples:
 
@@ -130,6 +169,7 @@ Examples:
 | `/cache/` | yes | yes | yes | `cache` |
 | `dir/*` | no | no | no | `dir/*` |
 | `**/*.o` | no | no | no | `**/*.o` |
+| `**` | no | no | no | `**` |
 
 ---
 
@@ -144,19 +184,23 @@ Examples:
 | `**` | Zero or more **full path segments** (only as a `/`-separated segment, e.g. `a/**/b`) |
 
 Full-path patterns are split on `/` into tokens (`**` vs ordinary segment globs).
-A path matches only if the whole path matches (not a partial suffix match).
 
 ### Target selection
 
-1. If **basename mode** (no `/` in stored pattern):
+1. If **basename mode** (no `/` and no `**` in stored pattern):
    - Match `pattern` against the path’s final component only.
    - Example: `*.tmp` matches `dir/a.tmp` because basename `a.tmp` matches.
    - If **anchored**: match only when the path is a **single segment**
      (`/foo` matches `foo`, not `bar/foo`).
-2. If **full-path mode** (pattern contains `/`):
-   - Match `pattern` against the entire relative path with segment-aware globs.
-   - Example: `dir/*` matches `dir/x` but not `dir/sub/x` (`*` does not cross `/`).
+2. If **full-path mode** (pattern contains `/` and/or `**`):
+   - **Anchored** (`/pat`): match against the entire relative path from the start.
+   - **Unanchored**: rsync-style **end-anchor** — the pattern may match any
+     **suffix** of the path segments (`foo/bar` matches `foo/bar` and `a/foo/bar`,
+     but not `foo/bar/x`).
+   - Example: `dir/*` matches `dir/x` and `a/dir/x`, but not `dir/sub/x`
+     (`*` does not cross `/`).
    - Example: `**/*.o` matches `x/y.o` and `y.o`.
+   - Example: bare `**` matches any path.
 
 ### Dir-only application
 
@@ -287,8 +331,42 @@ read_capped_lines(path)?;  // shared with future files-from
 | 23 | exclude `dir/*` | `dir/x` | F | Exclude |
 | 24 | exclude `dir/*` | `dir/sub/x` | F | Include (`*` one segment) |
 | 25 | include-from with `#` comments | (parse) | — | comments ignored |
+| 26 | exclude `foo/bar` | `a/foo/bar` | F | **Exclude** (end-anchor) |
+| 27 | exclude `/foo/bar` | `a/foo/bar` | F | Include (anchored) |
+| 28 | exclude `**` | `a/b/c` | F | Exclude |
 
 Automated: `tests/filter_parity.rs` (extends this table).
+
+---
+
+## Live rsync parity
+
+When `rsync` is installed on the machine, integration test
+[`tests/rsync_live_parity.rs`](../tests/rsync_live_parity.rs) builds a small fixture
+tree and compares **dry-run file sets**:
+
+| Side | Command (sketch) |
+|------|------------------|
+| rsync | `rsync -a -n --out-format='%n' … "$SRC/" "$DEST/"` |
+| rsync-archive | `rsync-archive create -o out.7z -n … "$SRC/"` |
+
+Both use **trailing-slash SRC** so paths are archive-root relative (no SRC basename
+prefix). rsync directory members (paths ending in `/`) are dropped; only regular-file
+relative paths are compared (order-independent).
+
+Scenarios covered:
+
+1. **Exclude** `*.tmp` — basename exclude.
+2. **Include-only** `*.c` — filter file `+ */` / `+ *.c` / `- *` (the `+ */` line is
+   required so rsync descends into directories; without it rsync selects only root-level
+   matches).
+3. **Tree include** — `+ /data/` + `+ /data/**` + `- *` → only files under `data/`.
+4. **Tree include without `/**`** — `+ /data/` + `- *` → **no files** under `data/`
+   (directory include alone does not pack contents; match rsync, not a looser walk).
+
+If `rsync` is missing, each test soft-skips (`eprintln` + return) rather than
+`#[ignore]`, so CI without rsync stays green while developer machines with rsync
+get live parity.
 
 ---
 
@@ -374,8 +452,9 @@ max=50M           core
 ```
 
 - Pattern uses the same glob rules as rsync filters (`*`, `**`, `?`, basename if no `/`).
-- Exactly one `max=SIZE` per line. **First matching line wins.**
+- Exactly one `max=SIZE` per line (`8192`, `8K`, `100M`, `1G`, …). **First matching line wins.**
 - Paths not matched by any line are not size-capped by this file.
+- **Invalid lines are logged and ignored** (create does not abort).
 
 **`--dir-max-size-from`**:
 
@@ -519,11 +598,12 @@ See also Stage 9 in `docs/DESIGN.md`.
 |-------|------|
 | No match | **Include** |
 | First match | wins |
-| No `/` in pattern | **basename** match (K27) |
+| No `/` and no `**` in pattern | **basename** match (K27) |
+| Unanchored multi-segment | **end-anchored** (suffix) |
 | Trailing `/` | directory-only |
-| Leading `/` | anchored |
+| Leading `/` | anchored (left) |
 | `*` | one segment |
-| `**` | across segments |
+| `**` | across segments; forces full-path mode |
 | Filter file caps | 10 MiB / 1M lines |
 | Merge / dir-merge | **not** implemented |
 | Dir size budgets | newest-mtime-first; recursive under PATH/; longest prefix; post-filter |

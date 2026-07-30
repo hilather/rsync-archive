@@ -141,9 +141,10 @@ jobs:
             Multi-distro release builds (x86_64, default features).
 
             ### Highlights
-            - Release tarballs contain binary **`rsync-archive`** (no OS/version suffix in the binary name)
-            - Walk robustness: soft-skip vanished `/tmp` files, `/proc` races, unreadable dirs
-            - **`--include-cwd`**, restriction lists, tar-zstd/tar-lz4, non-solid 7z default
+            - Rsync-aligned filters: **`--filter-from`**, dir include vs `/**`, end-anchor; live rsync dry-run parity tests
+            - Soft-skip vanished files at selection/open; invalid restriction-list lines ignored
+            - Release tarballs contain binary **`rsync-archive`** (no OS suffix inside the tar)
+
 
             ### Supported CI targets
             | Distro | Versions |

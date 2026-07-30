@@ -48,6 +48,12 @@ fn basename(path: &str) -> &str {
 }
 
 /// Whether `rule` matches archive-relative `path` (`is_dir` for dir-only rules).
+///
+/// **Rsync-aligned directory rules** (trailing `/`):
+/// - **Exclude** `foo/`: matches the directory and all files under it (via ancestors).
+/// - **Include** `foo/`: matches the directory itself only (for traversal/prune). It does
+///   **not** auto-include every file under `foo/`; use `foo/**` (or similar) for that.
+///   Classic idiom: `+ /data/` + `+ /data/**` + `- *`.
 pub fn path_matches_rule(rule: &Rule, path: &str, is_dir: bool) -> bool {
     let path = normalize_match_path(path);
     if path.is_empty() {
@@ -58,11 +64,13 @@ pub fn path_matches_rule(rule: &Rule, path: &str, is_dir: bool) -> bool {
         if is_dir {
             return match_target(rule, path);
         }
-        // File: match if any ancestor directory matches as a directory.
-        // e.g. `foo/` excludes `foo/bar` and `foo/a/b`.
-        for ancestor in path_ancestors(path) {
-            if match_target(rule, ancestor) {
-                return true;
+        // Exclude: directory pattern applies to all contents (rsync).
+        // Include: only the directory entry itself matches — not descendant files.
+        if rule.action == RuleAction::Exclude {
+            for ancestor in path_ancestors(path) {
+                if match_target(rule, ancestor) {
+                    return true;
+                }
             }
         }
         return false;
@@ -83,8 +91,14 @@ fn match_target(rule: &Rule, path: &str) -> bool {
         return glob_match_segment(&rule.pattern, basename(path));
     }
 
-    // Full relative path (with `/` in pattern).
-    glob_match_path(&rule.pattern, path)
+    // Full relative path (pattern has `/` and/or `**`).
+    // Anchored `/pat`: match from the start of the archive path only.
+    // Unanchored: rsync end-anchors multi-segment patterns (`foo/bar` matches `a/foo/bar`).
+    if rule.anchored {
+        glob_match_path(&rule.pattern, path)
+    } else {
+        glob_match_path_end_anchored(&rule.pattern, path)
+    }
 }
 
 /// Ancestors of a path, outermost first, excluding the path itself.
@@ -129,6 +143,8 @@ fn tokenize_pattern(pat: &str) -> Vec<Tok> {
 }
 
 /// Full-path glob match (pattern may contain `/`, `*`, `**`, `?`).
+///
+/// Matches the **entire** path from the first segment (left-anchored).
 pub fn glob_match_path(pat: &str, path: &str) -> bool {
     let toks = tokenize_pattern(pat);
     let segs: Vec<&str> = if path.is_empty() {
@@ -137,6 +153,34 @@ pub fn glob_match_path(pat: &str, path: &str) -> bool {
         path.split('/').collect()
     };
     match_tokens(&toks, 0, &segs, 0)
+}
+
+/// Unanchored full-path match: pattern may match any **suffix** of the path segments
+/// (rsync: patterns without leading `/` are end-anchored).
+///
+/// Examples: `foo/bar` matches `foo/bar` and `a/foo/bar`, but not `foo/bar/x`.
+pub fn glob_match_path_end_anchored(pat: &str, path: &str) -> bool {
+    let toks = tokenize_pattern(pat);
+    let segs: Vec<&str> = if path.is_empty() {
+        Vec::new()
+    } else {
+        path.split('/').collect()
+    };
+    // Try each suffix of the path (including the full path).
+    for start in 0..=segs.len() {
+        if start == segs.len() {
+            // Empty suffix only if pattern can match empty (e.g. lone `**` already
+            // handled via full-path zeros); empty path was rejected upstream.
+            if segs.is_empty() && match_tokens(&toks, 0, &[], 0) {
+                return true;
+            }
+            break;
+        }
+        if match_tokens(&toks, 0, &segs[start..], 0) {
+            return true;
+        }
+    }
+    false
 }
 
 fn match_tokens(toks: &[Tok], ti: usize, segs: &[&str], si: usize) -> bool {
@@ -254,12 +298,13 @@ pub fn include_rule_may_match_under(rule: &Rule, dir: &str) -> bool {
         return true;
     }
 
-    // Full-path patterns: check segment compatibility with prefix `dir`.
-    if rule.pattern.contains("**") {
-        // Hard to prove negative; walk more.
+    // Full-path patterns with `**`, or unanchored (end-anchored) multi-segment patterns,
+    // may match under any directory (suffix can appear deeper). Conservative: walk.
+    if rule.pattern.contains("**") || !rule.anchored {
         return true;
     }
 
+    // Anchored full-path without `**`: segment prefix analysis.
     pattern_may_match_under_dir(&rule.pattern, dir, rule.anchored, rule.dir_only)
 }
 
@@ -374,6 +419,44 @@ mod tests {
     }
 
     #[test]
+    fn end_anchored_unanchored_path() {
+        assert!(glob_match_path_end_anchored("foo/bar", "foo/bar"));
+        assert!(glob_match_path_end_anchored("foo/bar", "a/foo/bar"));
+        assert!(glob_match_path_end_anchored("foo/bar", "x/y/foo/bar"));
+        assert!(!glob_match_path_end_anchored("foo/bar", "foo/bar/x"));
+        assert!(!glob_match_path_end_anchored("foo/bar", "foo"));
+        assert!(glob_match_path_end_anchored("dir/*", "a/dir/x"));
+        assert!(!glob_match_path_end_anchored("dir/*", "a/dir/sub/x"));
+    }
+
+    #[test]
+    fn unanchored_path_rule_matches_suffix() {
+        let mut rs = RuleSet::new();
+        rs.push_exclude("foo/bar").unwrap();
+        assert_eq!(rs.action_for("foo/bar", false), RuleAction::Exclude);
+        assert_eq!(rs.action_for("a/foo/bar", false), RuleAction::Exclude);
+        assert_eq!(rs.action_for("foo/bar/x", false), RuleAction::Include);
+    }
+
+    #[test]
+    fn bare_double_star_is_full_path() {
+        let r = crate::select::rules::parse_rule(RuleAction::Exclude, "**").unwrap();
+        assert!(!r.basename_mode());
+        let mut rs = RuleSet::new();
+        rs.push_exclude("**").unwrap();
+        assert_eq!(rs.action_for("a", false), RuleAction::Exclude);
+        assert_eq!(rs.action_for("a/b/c", false), RuleAction::Exclude);
+    }
+
+    #[test]
+    fn anchored_path_still_left_only() {
+        let mut rs = RuleSet::new();
+        rs.push_exclude("/foo/bar").unwrap();
+        assert_eq!(rs.action_for("foo/bar", false), RuleAction::Exclude);
+        assert_eq!(rs.action_for("a/foo/bar", false), RuleAction::Include);
+    }
+
+    #[test]
     fn action_default_include() {
         let rs = RuleSet::new();
         assert_eq!(rs.action_for("any", false), RuleAction::Include);
@@ -389,6 +472,35 @@ mod tests {
         // Exact file named cache (not a dir) is NOT excluded by cache/
         assert_eq!(rs.action_for("cache", false), RuleAction::Include);
         assert_eq!(rs.action_for("other", false), RuleAction::Include);
+    }
+
+    #[test]
+    fn dir_only_include_does_not_match_descendant_files() {
+        // Classic rsync: + /data/  - *  does NOT include data/elasticsearch/x
+        // without also + /data/**
+        let mut rs = RuleSet::new();
+        rs.push_include("/data/").unwrap();
+        rs.push_exclude("*").unwrap();
+        assert_eq!(rs.action_for("data", true), RuleAction::Include);
+        assert_eq!(
+            rs.action_for("data/elasticsearch/indices/x", false),
+            RuleAction::Exclude
+        );
+        assert_eq!(rs.action_for("data/file.txt", false), RuleAction::Exclude);
+        // With ** include under data:
+        let mut rs2 = RuleSet::new();
+        rs2.push_include("/data/").unwrap();
+        rs2.push_include("/data/**").unwrap();
+        rs2.push_exclude("*").unwrap();
+        assert_eq!(
+            rs2.action_for("data/elasticsearch/indices/x", false),
+            RuleAction::Include
+        );
+        assert_eq!(rs2.action_for("other/x", false), RuleAction::Exclude);
+        // Prune elasticsearch when only + /data/ - *
+        assert!(rs.should_prune_dir("data/elasticsearch"));
+        // Do not prune data itself
+        assert!(!rs.should_prune_dir("data"));
     }
 
     #[test]
