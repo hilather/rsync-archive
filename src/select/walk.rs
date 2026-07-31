@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::util::is_skippable_fs_io;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use tracing::{debug, warn};
+use tracing::debug;
 use walkdir::{DirEntry, WalkDir};
 
 /// Kind of selected archive member (file body vs link metadata only).
