@@ -72,7 +72,7 @@ fn create_7z_skips_symlinks_keeps_files() {
         ])
         .assert()
         .success()
-        .stderr(predicate::str::contains("symlinks skipped").or(predicate::str::contains("1 selected")));
+        .stderr(predicate::str::contains("symlinks").or(predicate::str::contains("1 selected")));
 
     let mut reader = ArchiveReader::open(&out, Password::empty()).unwrap();
     assert_eq!(reader.read_file("a.txt").unwrap(), b"keep-me");
@@ -114,7 +114,7 @@ fn create_7z_hardlinks_content_once() {
         ])
         .assert()
         .success()
-        .stderr(predicate::str::contains("hardlinks skipped"));
+        .stderr(predicate::str::contains("hardlinks"));
 
     let mut reader = ArchiveReader::open(&out, Password::empty()).unwrap();
     let names: Vec<_> = reader

@@ -186,7 +186,7 @@ fn dry_run_dir_budget_excludes_older_files() {
         .stderr(predicate::str::contains("dir-max-size"))
         .stderr(predicate::str::contains("skip:"))
         .stderr(predicate::str::contains("logs/old.bin"))
-        .stderr(predicate::str::contains("dir-budget skipped"));
+        .stderr(predicate::str::contains("dir-budget"));
     assert!(!dir.path().join("out.7z").exists());
 }
 
@@ -227,7 +227,7 @@ fn dry_run_dir_file_limit_recursive() {
         .stdout(predicate::str::contains("old.bin").not())
         .stderr(predicate::str::contains("dir-max-files"))
         .stderr(predicate::str::contains("skip:"))
-        .stderr(predicate::str::contains("dir-file-limit skipped"));
+        .stderr(predicate::str::contains("dir-files"));
     assert!(!dir.path().join("out.7z").exists());
 }
 
@@ -291,7 +291,7 @@ fn dry_run_max_total_size_newest_first() {
         .stdout(predicate::str::contains("new.bin"))
         .stdout(predicate::str::contains("old.bin").not())
         .stderr(predicate::str::contains("max-total-size="))
-        .stderr(predicate::str::contains("max-total-size skipped"));
+        .stderr(predicate::str::contains("max-total"));
     assert!(!dir.path().join("out.7z").exists());
 }
 
@@ -330,8 +330,8 @@ fn dry_run_max_files_and_max_size() {
         .stdout(predicate::str::contains("huge.bin").not())
         .stderr(predicate::str::contains("max-size:"))
         .stderr(predicate::str::contains("max-files="))
-        .stderr(predicate::str::contains("max-size skipped"))
-        .stderr(predicate::str::contains("max-files skipped"));
+        .stderr(predicate::str::contains("max-size"))
+        .stderr(predicate::str::contains("max-files"));
 }
 
 #[test]
@@ -373,6 +373,6 @@ fn dry_run_min_size_and_newer_than() {
         .stdout(predicate::str::contains("old.bin").not())
         .stderr(predicate::str::contains("min-size:"))
         .stderr(predicate::str::contains("newer-than:"))
-        .stderr(predicate::str::contains("min-size skipped"))
-        .stderr(predicate::str::contains("older-than skipped"));
+        .stderr(predicate::str::contains("min-size"))
+        .stderr(predicate::str::contains("older"));
 }

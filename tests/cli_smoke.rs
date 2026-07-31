@@ -63,6 +63,8 @@ fn create_help_shows_key_flags() {
         .stdout(predicate::str::contains("--newer-than"))
         .stdout(predicate::str::contains("--method"))
         .stdout(predicate::str::contains("--format"))
+        .stdout(predicate::str::contains("--allow-empty"))
+        .stdout(predicate::str::contains("--files-from-skip-missing"))
         .stdout(predicate::str::contains("seekable-zstd"))
         .stdout(predicate::str::contains("tar-zstd"))
         .stdout(predicate::str::contains("tar-lz4"))
@@ -249,6 +251,7 @@ fn create_validate_unit_rejects_both_modes() {
         exclude_from: vec![],
         include_from: vec![],
         files_from: Some(PathBuf::from("list.txt")),
+        files_from_skip_missing: false,
         include_cwd: false,
         filter_from: vec![],
         filter: vec![],
@@ -268,6 +271,7 @@ fn create_validate_unit_rejects_both_modes() {
         min_size: None,
         newer_than: None,
         verify: false,
+        allow_empty: false,
         sources: vec!["src".into()],
     };
     assert!(args.validate().is_err());
@@ -288,6 +292,7 @@ fn create_validate_unit_accepts_sources_only() {
         exclude_from: vec![],
         include_from: vec![],
         files_from: None,
+        files_from_skip_missing: false,
         include_cwd: false,
         filter_from: vec![],
         filter: vec![],
@@ -307,6 +312,7 @@ fn create_validate_unit_accepts_sources_only() {
         min_size: None,
         newer_than: None,
         verify: false,
+        allow_empty: false,
         sources: vec!["src".into()],
     };
     assert!(args.validate().is_ok());

@@ -5,6 +5,12 @@
 //! Uncompressed payload is a length-prefixed member stream with a trailing
 //! binary index; the whole payload is wrapped in the Zstd **seekable** format
 //! via [`zeekstd`] (independent frames + seek table).
+//!
+//! **Soft-fail create:** skippable open errors skip the member. After open,
+//! `data_len` is taken from post-open metadata (not selection). Early EOF or
+//! skippable mid-read after the member header is **zero-padded** (warn) so the
+//! declared length stays consistent. Growing files are capped at post-open size.
+//! If every member is skipped, returns [`Error::EmptyArchive`].
 
 use crate::error::{Error, Result};
 use crate::select::SelectedEntry;
@@ -63,11 +69,20 @@ fn zstd_level(level: u32) -> i32 {
 ///
 /// Streaming: each file is read in chunks into the encoder; peak RAM is
 /// O(frame size + I/O buffers), not O(total archive size).
+///
+/// Soft-fail / size races: open → re-stat for `data_len` → write header → stream
+/// exactly that many bytes (pad on short read). Soft-skip only on skippable open
+/// failure. See module docs.
+///
+/// Returns [`CreateWriteStats`]; `members_written == 0` means no members were
+/// archived (caller handles empty / all-vanished).
 pub fn write_seekable_zstd(
     path: &Path,
     entries: &[SelectedEntry],
     level: u32,
-) -> Result<()> {
+) -> Result<crate::archive::CreateWriteStats> {
+    use crate::archive::CreateWriteStats;
+
     if entries.is_empty() {
         return Err(Error::EmptyArchive);
     }
@@ -87,34 +102,33 @@ pub fn write_seekable_zstd(
 
     let mut index_entries: Vec<MemberIndexEntry> = Vec::with_capacity(entries.len());
     let mut uncompressed_pos: u64 = 0;
+    let mut stats = CreateWriteStats::default();
 
     for e in entries {
         let name_bytes = e.archive_name.as_bytes();
         let name_len = name_bytes.len() as u64;
-        let data_len = e.size;
 
-        // Open first so vanished files skip the whole member.
-        let mut body = if data_len > 0 {
-            match File::open(&e.abs_path) {
-                Ok(f) => Some(f),
-                Err(err) if crate::util::is_skippable_fs_io(&err) => {
-                    tracing::warn!(
-                        path = %e.abs_path.display(),
-                        name = %e.archive_name,
-                        error = %err,
-                        "skip vanished or inaccessible file in seekable-zstd"
-                    );
-                    continue;
-                }
-                Err(err) => {
-                    return Err(Error::Archive(format!(
-                        "open {} for seekable-zstd: {err}",
-                        e.abs_path.display()
-                    )));
+        // Open first so vanished files skip the whole member (no orphan header).
+        // Re-stat for actual size used in header + index.
+        // EINTR is retried inside open_file_for_encode (not soft-skipped).
+        let (mut body, data_len) = match crate::util::open_file_for_encode(&e.abs_path) {
+            Ok(f) => {
+                let actual = f.metadata().map(|m| m.len()).unwrap_or(e.size);
+                if actual > 0 {
+                    (Some(f), actual)
+                } else {
+                    (None, 0)
                 }
             }
-        } else {
-            None
+            Err(Error::Vanished(_)) => {
+                crate::util::soft_skip_note(
+                    crate::util::SoftKind::Vanished,
+                    &e.archive_name,
+                );
+                stats.skipped_vanished += 1;
+                continue;
+            }
+            Err(err) => return Err(err),
         };
 
         // Header: name_len | name | data_len
@@ -126,16 +140,8 @@ pub fn write_seekable_zstd(
             .checked_add(8 + name_len + 8)
             .ok_or_else(|| Error::Archive("uncompressed offset overflow".into()))?;
 
-        let written = if let Some(ref mut f) = body {
-            stream_reader_into_encoder(&mut encoder, f, data_len, &e.abs_path)?
-        } else {
-            0
-        };
-        if written != data_len {
-            return Err(Error::Archive(format!(
-                "size changed while archiving {}: expected {data_len}, wrote {written}",
-                e.abs_path.display()
-            )));
+        if let Some(ref mut f) = body {
+            stream_reader_exact_or_pad(&mut encoder, f, data_len, &e.abs_path)?;
         }
 
         index_entries.push(MemberIndexEntry {
@@ -143,6 +149,7 @@ pub fn write_seekable_zstd(
             data_offset,
             data_len,
         });
+        stats.members_written += 1;
 
         uncompressed_pos = data_offset
             .checked_add(data_len)
@@ -156,6 +163,11 @@ pub fn write_seekable_zstd(
         );
     }
 
+    if stats.members_written == 0 {
+        drop(encoder);
+        return Ok(stats);
+    }
+
     // Trailing index + u64 index_start (points at INDEX_MAGIC).
     let index_start = uncompressed_pos;
     let index_bytes = encode_index(&index_entries)?;
@@ -166,7 +178,7 @@ pub fn write_seekable_zstd(
         Error::Compress(format!("seekable-zstd finish: {e}"))
     })?;
 
-    Ok(())
+    Ok(stats)
 }
 
 fn encode_index(members: &[MemberIndexEntry]) -> Result<Vec<u8>> {
@@ -199,35 +211,60 @@ fn write_all_encoded<W: Write>(encoder: &mut Encoder<'_, W>, mut data: &[u8]) ->
     Ok(())
 }
 
-fn stream_reader_into_encoder<W: Write, R: Read>(
+/// Stream exactly `declared_len` bytes. Cap at that length (ignore growth).
+/// Early EOF or skippable mid-read: pad zeros for the remainder and warn.
+fn stream_reader_exact_or_pad<W: Write, R: Read>(
     encoder: &mut Encoder<'_, W>,
     f: &mut R,
-    expected_len: u64,
+    declared_len: u64,
     path: &Path,
-) -> Result<u64> {
+) -> Result<()> {
     let mut buf = vec![0u8; 128 * 1024];
-    let mut total = 0u64;
-    loop {
-        let n = f.read(&mut buf).map_err(|e| {
-            if crate::util::is_skippable_fs_io(&e) {
-                Error::Vanished(path.to_path_buf())
-            } else {
-                Error::Archive(format!("read {} for seekable-zstd: {e}", path.display()))
+    let mut remaining = declared_len;
+    while remaining > 0 {
+        let chunk = remaining.min(buf.len() as u64) as usize;
+        let n = match crate::util::read_retrying(f, &mut buf[..chunk]) {
+            Ok(0) => {
+                let got = declared_len - remaining;
+                crate::util::soft_skip_note_detail(
+                    crate::util::SoftKind::Padded,
+                    &path.display().to_string(),
+                    Some(&format!("eof got={got}/{declared_len}")),
+                );
+                write_zeros_encoded(encoder, remaining)?;
+                return Ok(());
             }
-        })?;
-        if n == 0 {
-            break;
-        }
+            Ok(n) => n,
+            Err(e) if crate::util::is_skippable_fs_io(&e) => {
+                crate::util::soft_skip_note_detail(
+                    crate::util::SoftKind::Padded,
+                    &path.display().to_string(),
+                    Some(&format!("io rem={remaining}: {e}")),
+                );
+                write_zeros_encoded(encoder, remaining)?;
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(Error::Archive(format!(
+                    "read {} for seekable-zstd: {e}",
+                    path.display()
+                )));
+            }
+        };
         write_all_encoded(encoder, &buf[..n])?;
-        total = total.saturating_add(n as u64);
-        if total > expected_len {
-            return Err(Error::Archive(format!(
-                "file grew while archiving {}: expected at most {expected_len}",
-                path.display()
-            )));
-        }
+        remaining -= n as u64;
     }
-    Ok(total)
+    Ok(())
+}
+
+fn write_zeros_encoded<W: Write>(encoder: &mut Encoder<'_, W>, mut n: u64) -> Result<()> {
+    let zero = [0u8; 4096];
+    while n > 0 {
+        let take = n.min(zero.len() as u64) as usize;
+        write_all_encoded(encoder, &zero[..take])?;
+        n -= take as u64;
+    }
+    Ok(())
 }
 
 /// Open a seekable-zstd archive and parse the member index (seek-based; no full decompress).

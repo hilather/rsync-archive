@@ -42,6 +42,8 @@ The **uncompressed** payload inside those frames is:
 
 `data_offset` points at the first **file content** byte (after that member’s `name_len|name|data_len` header), measured from the start of the **uncompressed** payload.
 
+**Soft-fail create:** `data_len` is post-open re-stat (not selection size). Skippable open skips the member; short read after the header is zero-padded. All members skipped → empty archive error.
+
 The final `index_start` is always the last 8 uncompressed bytes, so readers can:
 
 1. Open the file with a seekable-zstd decoder (`zeekstd::Decoder`).

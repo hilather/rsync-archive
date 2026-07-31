@@ -58,7 +58,7 @@ for each member:
 u64 LE       index_start   // final 8 bytes of uncompressed payload
 ```
 
-Same member metadata as [`FORMAT_TAR_ZSTD.md`](FORMAT_TAR_ZSTD.md) (mode/uid/gid from selection; uname/gname in tar headers only; **directory members** for parent prefixes; **symlinks** as `typeflag='2'` and **hard links** as `typeflag='1'`, both with no data body, `data_len=0` in index).
+Same member metadata as [`FORMAT_TAR_ZSTD.md`](FORMAT_TAR_ZSTD.md) (mode/uid/gid from selection; uname/gname in tar headers only; **directory members** for parent prefixes; **symlinks** as `typeflag='2'` and **hard links** as `typeflag='1'`, both with no data body, `data_len=0` in index). Regular-file **size** is post-open re-stat (soft-fail / pad policy same as tar.zst).
 
 ### Frame table (`RATLFRM1`, version 1)
 
@@ -85,6 +85,8 @@ decompress only frames covering `[index_start, total)` for list, or
 ### Metadata (v1 complete)
 
 Same as tar.zst: path, size, mtime, mode, uid, gid (from selection); uname/gname resolved at walk into ustar (pax if &gt;32 bytes); regular files, **hard links** (`typeflag='1'`, linkname = first archive path), **symbolic links** (`typeflag='2'`, linkname / pax `linkpath`, size 0), **and** parent directory members (`typeflag='5'`, trailing `/`, size 0). Names and link targets are **not** in `RATAIDX1` (headers only).
+
+**Hard-link soft-fail (same as tar.zst):** `write_tar_lz4` emits a hard-link member only if the target File body was written this run; if the body was soft-skipped at open, dependent HardLink members are soft-skipped (`skipped_vanished`) — no dangling typeflag `'1'`.
 
 ---
 

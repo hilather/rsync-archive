@@ -139,9 +139,13 @@ Run before every commit when `src/` or `tests/` (or behavior) changed.
 | Overwrite | **Error** if `-o` exists unless `--force` |
 | Atomic write | `OUT.partial` → rename after successful finish |
 | Empty write | **Error** (dry-run of empty selection may exit 0 with message) |
+| `--allow-empty` | **Off**; empty selection or all members soft-skipped at encode → exit 0, **no** `-o` + warning; without flag hard-fail |
+| Encode soft-skip | Open-time vanish/EACCES/ESTALE → omit member (`skipped_vanished`); all soft-skipped → error unless `--allow-empty` |
 | Symlinks | **tar-zstd / tar-lz4:** archived as typeflag `'2'` (linkname; size 0). **7z / seekable-zstd:** skipped (counted). Special files always skipped. |
 | Hard links | **Unix:** first `(dev,ino)` path is full file; later → `HardLink` (size 0). **tar-zstd / tar-lz4:** typeflag `'1'` (linkname = first archive path). **7z / seekable-zstd:** skip hard-link members (keep first file). Non-Unix: no detection. |
 | `--files-from` | Exclusive of `SRC...`; paths relative to **CWD** unless absolute |
+| `--files-from-skip-missing` | **Off**; soft-skip missing/unreadable list lines (default hard-fail) |
+| Multi-SRC missing root | Soft-skip when ≥2 SRCs or `--include-cwd`; single missing SRC hard-fails |
 | `--include-cwd` | **Off** by default; pack CWD at archive root; skip `-o`/`.partial`; **no rsync filters** on CWD |
 | Patterns without `/` (and without `**`) | Match **basename** (e.g. `*.tmp` matches `dir/a.tmp`); unanchored multi-segment end-anchored; prefer `--filter-from` for ordered mixes |
 | Streaming | Peak RAM O(dict + I/O buffers), not O(file size) for create |

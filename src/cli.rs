@@ -152,6 +152,14 @@ pub struct CreateArgs {
     #[arg(long = "files-from", value_name = "FILE")]
     pub files_from: Option<PathBuf>,
 
+    /// Soft-skip missing/unreadable `--files-from` lines instead of hard-failing.
+    ///
+    /// Default off (any missing path aborts). When set, NotFound / PermissionDenied /
+    /// similar skippable I/O errors on a list line are counted and warned; other
+    /// errors still abort.
+    #[arg(long = "files-from-skip-missing", default_value_t = false)]
+    pub files_from_skip_missing: bool,
+
     /// Also pack all files under the process CWD at archive root (trailing-`/` style).
     ///
     /// Off by default. Skips the `-o` output file and its `.partial` temp. Combines
@@ -250,6 +258,14 @@ pub struct CreateArgs {
     /// After write, verify archive (member count / sample extract by format).
     #[arg(long = "verify")]
     pub verify: bool,
+
+    /// Allow empty selection or all members vanishing at encode: exit 0, write no `-o`.
+    ///
+    /// Without this flag, empty selection or all soft-skipped members at encode
+    /// is an error (`empty archive` / all-vanished message). With `--allow-empty`,
+    /// print a warning and succeed without writing an output file.
+    #[arg(long = "allow-empty")]
+    pub allow_empty: bool,
 
     /// Source paths (dirs/files). Required unless `--files-from` or `--include-cwd`.
     /// Trailing `/` strips dir name.
@@ -428,6 +444,7 @@ mod tests {
             exclude_from: vec![],
             include_from: vec![],
             files_from: None,
+            files_from_skip_missing: false,
             include_cwd: false,
             filter_from: vec![],
             filter: vec![],
@@ -447,6 +464,7 @@ mod tests {
             min_size: None,
             newer_than: None,
             verify: false,
+            allow_empty: false,
             sources: vec![".".into()],
         };
         let err = args.validate().unwrap_err();

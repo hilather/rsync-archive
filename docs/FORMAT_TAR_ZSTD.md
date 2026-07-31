@@ -61,7 +61,7 @@ Readers: seek to `size_decomp - 8`, read `index_start`, parse index, then
 | Field | Source |
 |-------|--------|
 | path | `SelectedEntry.archive_name` (ustar name/prefix or pax `path=`) |
-| size | selection size (directories, symlinks, and hard links: always 0) |
+| size | **post-open re-stat** for regular files (not selection size); directories, symlinks, and hard links: always 0. Soft-fail: skippable open skips member; short read after header is zero-padded |
 | mtime | `mtime_unix` or 0 (directories: statted from real dir when available; links: `lstat`) |
 | mode | `st_mode & 0o7777` at selection (default `0644` if unknown; dirs default `0755`) |
 | uid / gid | at selection (0 if unknown / non-Unix); pax if &gt; 7-digit octal |
@@ -90,6 +90,7 @@ Derived from selected **file, symlink, and hard-link** archive paths (not a sepa
 - On **Unix**, walk / `--files-from` detect hard links via `(st_dev, st_ino)`: first regular-file path is `MemberKind::File` with content size; later paths are `MemberKind::HardLink { target }` where `target` is the first path’s `archive_name` (size 0 for restriction accounting).
 - Tar create emits `typeflag='1'`; linkname / pax `linkpath` is that first archive path (not a filesystem path rewrite).
 - No file data body; `RATAIDX1` has `data_len=0`.
+- **Encode soft-fail:** `write_tar_zstd` only emits a hard-link member if the target File body was actually written this run. If the body was soft-skipped at open (vanished / EACCES / ESTALE), later HardLink members pointing at that name are soft-skipped too (`skipped_vanished`) so the archive never contains a dangling typeflag `'1'`. Pre-encode `filter_hardlinks_without_targets` cannot catch this race.
 - **Non-Unix:** no hard-link detection (each path is a full `File` member).
 - **7z** and **seekable-zstd** skip hard-link entries at encode time (`skipped_hardlinks`), keeping only the first file body for the inode.
 

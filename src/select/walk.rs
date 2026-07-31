@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::util::is_skippable_fs_io;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use tracing::debug;
+use tracing::{debug, warn};
 use walkdir::{DirEntry, WalkDir};
 
 /// Kind of selected archive member (file body vs link metadata only).
@@ -211,7 +211,8 @@ fn cstr_to_string(ptr: *const libc::c_char) -> String {
 pub struct SelectionStats {
     pub selected: u64,
     pub skipped_symlinks: u64,
-    /// Hard-link members dropped at encode for formats that only pack regular files.
+    /// Hard-link members dropped at encode for formats that only pack regular files,
+    /// or dropped because their target File body is absent.
     pub skipped_hardlinks: u64,
     pub skipped_special: u64,
     pub skipped_excluded: u64,
@@ -232,6 +233,15 @@ pub struct SelectionStats {
     pub skipped_max_total_size: u64,
     /// Dropped by global `--max-files` (newest-first).
     pub skipped_max_files: u64,
+    /// Missing/unreadable lines soft-skipped under `--files-from-skip-missing`.
+    pub skipped_files_from_missing: u64,
+    /// Missing/unreadable SRC roots soft-skipped when multiple SRCs or `--include-cwd`.
+    pub skipped_missing_src: u64,
+    /// Soft-skipped at encode/open (vanished, EACCES, ESTALE, … after selection).
+    ///
+    /// Not set during walk; create writers increment this when a selected member
+    /// cannot be opened/read and is dropped instead of failing the whole job.
+    pub skipped_vanished: u64,
 }
 
 /// Collect selected entries from SRC walk mode.
@@ -645,7 +655,12 @@ fn consider_symlink(
             return Err(Error::Selection(format!("read_link {}: {e}", path.display())));
         }
     };
-    let target = link_target_string(&target_path)?;
+    let Some(target) = link_target_string(&target_path) else {
+        names.remove(archive_name);
+        stats.skipped_special += 1;
+        crate::util::soft_skip_note(crate::util::SoftKind::Config, archive_name);
+        return Ok(());
+    };
 
     let abs_path = if path.is_absolute() {
         path.to_path_buf()
@@ -678,14 +693,35 @@ fn consider_symlink(
 }
 
 /// Convert a symlink target path to a UTF-8 string as stored (not resolved).
-fn link_target_string(target: &Path) -> Result<String> {
-    match target.to_str() {
-        Some(s) => Ok(s.to_string()),
-        None => Err(Error::Selection(format!(
-            "symlink target is not valid UTF-8: {}",
-            target.display()
-        ))),
-    }
+///
+/// Returns `None` when the target is not valid UTF-8; callers soft-skip
+/// ([`SelectionStats::skipped_special`]) rather than aborting selection.
+fn link_target_string(target: &Path) -> Option<String> {
+    target.to_str().map(|s| s.to_string())
+}
+
+/// Drop [`MemberKind::HardLink`] members whose target is not present as a
+/// [`MemberKind::File`] in the list.
+///
+/// Keeps all File and Symlink members. Use after encode soft-skips remove a
+/// hard-link target body, or as a safety net after format filtering. At normal
+/// selection time every HardLink already has its File target present.
+///
+/// Callers should update [`SelectionStats::skipped_hardlinks`] /
+/// [`SelectionStats::selected`] when counts matter.
+pub fn filter_hardlinks_without_targets(entries: Vec<SelectedEntry>) -> Vec<SelectedEntry> {
+    let file_names: HashSet<String> = entries
+        .iter()
+        .filter(|e| matches!(e.kind, MemberKind::File))
+        .map(|e| e.archive_name.clone())
+        .collect();
+    entries
+        .into_iter()
+        .filter(|e| match &e.kind {
+            MemberKind::HardLink { target } => file_names.contains(target),
+            MemberKind::File | MemberKind::Symlink { .. } => true,
+        })
+        .collect()
 }
 
 /// Collect entries from a `--files-from` list (K26).
@@ -696,9 +732,14 @@ fn link_target_string(target: &Path) -> Result<String> {
 /// [`collect_from_sources`]).
 /// Relative lines keep normalized path as `archive_name`; absolute lines use
 /// **basename only**. Filters apply to `archive_name`.
+///
+/// When `skip_missing` is true (CLI `--files-from-skip-missing`), lines that
+/// fail stat/read_link with [`is_skippable_fs_io`] are soft-skipped and counted
+/// in [`SelectionStats::skipped_files_from_missing`]. Default false hard-fails.
 pub fn collect_from_files_from(
     list_path: &Path,
     rules: &RuleSet,
+    skip_missing: bool,
 ) -> Result<(Vec<SelectedEntry>, SelectionStats)> {
     let lines = read_capped_lines(list_path)?;
     let cwd = std::env::current_dir()
@@ -723,13 +764,25 @@ pub fn collect_from_files_from(
             cwd.join(path_as_written)
         };
 
-        let meta = std::fs::symlink_metadata(&fs_path).map_err(|e| {
-            Error::Selection(format!(
-                "files-from line {}: stat {}: {e}",
-                idx + 1,
-                fs_path.display()
-            ))
-        })?;
+        let meta = match std::fs::symlink_metadata(&fs_path) {
+            Ok(m) => m,
+            Err(e) if skip_missing && is_skippable_fs_io(&e) => {
+                stats.skipped_files_from_missing += 1;
+                crate::util::soft_skip_note_detail(
+                    crate::util::SoftKind::FilesFrom,
+                    &fs_path.display().to_string(),
+                    Some(&format!("L{}: {e}", idx + 1)),
+                );
+                continue;
+            }
+            Err(e) => {
+                return Err(Error::Selection(format!(
+                    "files-from line {}: stat {}: {e}",
+                    idx + 1,
+                    fs_path.display()
+                )));
+            }
+        };
         let is_symlink = meta.file_type().is_symlink();
         if !is_symlink && !meta.is_file() {
             return Err(Error::NotRegularFile(fs_path));
@@ -759,19 +812,33 @@ pub fn collect_from_files_from(
         let (uname, gname) = names_for_uid_gid(uid, gid);
 
         let (kind, size) = if is_symlink {
-            let target_path = std::fs::read_link(&fs_path).map_err(|e| {
-                Error::Selection(format!(
-                    "files-from line {}: read_link {}: {e}",
-                    idx + 1,
-                    fs_path.display()
-                ))
-            })?;
-            (
-                MemberKind::Symlink {
-                    target: link_target_string(&target_path)?,
-                },
-                0u64,
-            )
+            let target_path = match std::fs::read_link(&fs_path) {
+                Ok(t) => t,
+                Err(e) if skip_missing && is_skippable_fs_io(&e) => {
+                    names.remove(&archive_name);
+                    stats.skipped_files_from_missing += 1;
+                    crate::util::soft_skip_note_detail(
+                        crate::util::SoftKind::FilesFrom,
+                        &fs_path.display().to_string(),
+                        Some(&format!("L{} read_link: {e}", idx + 1)),
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    return Err(Error::Selection(format!(
+                        "files-from line {}: read_link {}: {e}",
+                        idx + 1,
+                        fs_path.display()
+                    )));
+                }
+            };
+            let Some(target) = link_target_string(&target_path) else {
+                names.remove(&archive_name);
+                stats.skipped_special += 1;
+                crate::util::soft_skip_note(crate::util::SoftKind::Config, &archive_name);
+                continue;
+            };
+            (MemberKind::Symlink { target }, 0u64)
         } else {
             #[cfg(unix)]
             {
@@ -1006,7 +1073,7 @@ mod tests {
             format!("{}\n", abs_file.display()),
         )
         .unwrap();
-        let (entries, _) = collect_from_files_from(&list, &RuleSet::new()).unwrap();
+        let (entries, _) = collect_from_files_from(&list, &RuleSet::new(), false).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].archive_name, "abs.txt");
     }
@@ -1026,7 +1093,7 @@ mod tests {
             format!("{}\n{}\n", a.display(), b.display()),
         )
         .unwrap();
-        let err = collect_from_files_from(&list, &RuleSet::new()).unwrap_err();
+        let err = collect_from_files_from(&list, &RuleSet::new(), false).unwrap_err();
         assert!(matches!(err, Error::Collision(_)));
     }
 
@@ -1038,9 +1105,138 @@ mod tests {
         let list = dir.path().join("list.txt");
         fs::write(&list, format!("{}\n", f.display())).unwrap();
         let rules = rules_exclude("*.txt");
-        let (entries, stats) = collect_from_files_from(&list, &rules).unwrap();
+        let (entries, stats) = collect_from_files_from(&list, &rules, false).unwrap();
         assert!(entries.is_empty());
         assert_eq!(stats.skipped_excluded, 1);
+    }
+
+    #[test]
+    fn files_from_missing_hard_fails_by_default() {
+        let dir = tempdir().unwrap();
+        let list = dir.path().join("list.txt");
+        fs::write(&list, format!("{}\n", dir.path().join("gone.txt").display())).unwrap();
+        let err = collect_from_files_from(&list, &RuleSet::new(), false).unwrap_err();
+        assert!(matches!(err, Error::Selection(_)));
+    }
+
+    #[test]
+    fn files_from_skip_missing_soft_skips() {
+        let dir = tempdir().unwrap();
+        let keep = dir.path().join("keep.txt");
+        fs::write(&keep, b"ok").unwrap();
+        let list = dir.path().join("list.txt");
+        fs::write(
+            &list,
+            format!(
+                "{}\n{}\n",
+                dir.path().join("missing.txt").display(),
+                keep.display()
+            ),
+        )
+        .unwrap();
+        let (entries, stats) =
+            collect_from_files_from(&list, &RuleSet::new(), true).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].archive_name, "keep.txt");
+        assert_eq!(stats.skipped_files_from_missing, 1);
+        assert_eq!(stats.selected, 1);
+    }
+
+    #[test]
+    fn filter_hardlinks_without_targets_drops_orphans() {
+        let entries = vec![
+            SelectedEntry {
+                abs_path: PathBuf::from("/tmp/a"),
+                archive_name: "a".into(),
+                size: 10,
+                mtime_unix: None,
+                mode: DEFAULT_FILE_MODE,
+                uid: 0,
+                gid: 0,
+                uname: String::new(),
+                gname: String::new(),
+                kind: MemberKind::File,
+            },
+            SelectedEntry {
+                abs_path: PathBuf::from("/tmp/b"),
+                archive_name: "b".into(),
+                size: 0,
+                mtime_unix: None,
+                mode: DEFAULT_FILE_MODE,
+                uid: 0,
+                gid: 0,
+                uname: String::new(),
+                gname: String::new(),
+                kind: MemberKind::HardLink {
+                    target: "a".into(),
+                },
+            },
+            SelectedEntry {
+                abs_path: PathBuf::from("/tmp/c"),
+                archive_name: "c".into(),
+                size: 0,
+                mtime_unix: None,
+                mode: DEFAULT_FILE_MODE,
+                uid: 0,
+                gid: 0,
+                uname: String::new(),
+                gname: String::new(),
+                kind: MemberKind::HardLink {
+                    target: "missing".into(),
+                },
+            },
+            SelectedEntry {
+                abs_path: PathBuf::from("/tmp/d"),
+                archive_name: "d".into(),
+                size: 0,
+                mtime_unix: None,
+                mode: DEFAULT_FILE_MODE,
+                uid: 0,
+                gid: 0,
+                uname: String::new(),
+                gname: String::new(),
+                kind: MemberKind::Symlink {
+                    target: "x".into(),
+                },
+            },
+        ];
+        let kept = filter_hardlinks_without_targets(entries);
+        let names: Vec<_> = kept.iter().map(|e| e.archive_name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "d"]);
+    }
+
+    #[test]
+    fn filter_hardlinks_without_targets_keeps_all_when_targets_present() {
+        let entries = vec![
+            SelectedEntry {
+                abs_path: PathBuf::from("/tmp/a"),
+                archive_name: "a".into(),
+                size: 1,
+                mtime_unix: None,
+                mode: DEFAULT_FILE_MODE,
+                uid: 0,
+                gid: 0,
+                uname: String::new(),
+                gname: String::new(),
+                kind: MemberKind::File,
+            },
+            SelectedEntry {
+                abs_path: PathBuf::from("/tmp/b"),
+                archive_name: "b".into(),
+                size: 0,
+                mtime_unix: None,
+                mode: DEFAULT_FILE_MODE,
+                uid: 0,
+                gid: 0,
+                uname: String::new(),
+                gname: String::new(),
+                kind: MemberKind::HardLink {
+                    target: "a".into(),
+                },
+            },
+        ];
+        let kept = filter_hardlinks_without_targets(entries);
+        assert_eq!(kept.len(), 2);
     }
 
     #[cfg(unix)]
@@ -1151,5 +1347,51 @@ mod tests {
         let (entries, _) = collect_from_sources(&[src], &RuleSet::new()).unwrap();
         let total: u64 = entries.iter().map(|e| e.size).sum();
         assert_eq!(total, 5, "hard link must contribute size 0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_soft_skips_non_utf8_symlink_target() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("tree");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("ok.txt"), b"ok").unwrap();
+        let bad_target = OsStr::from_bytes(b"bad\xffname");
+        std::os::unix::fs::symlink(bad_target, root.join("badlink")).unwrap();
+
+        let src = SourceSpec::from_user_path(format!("{}/", root.display()).as_str()).unwrap();
+        let (entries, stats) = collect_from_sources(&[src], &RuleSet::new()).unwrap();
+        let names: Vec<_> = entries.iter().map(|e| e.archive_name.as_str()).collect();
+        assert_eq!(names, vec!["ok.txt"]);
+        assert_eq!(stats.skipped_special, 1);
+        assert!(!entries.iter().any(|e| e.is_symlink()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_from_soft_skips_non_utf8_symlink_target() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempdir().unwrap();
+        let keep = dir.path().join("keep.txt");
+        fs::write(&keep, b"k").unwrap();
+        let bad = dir.path().join("badlink");
+        let bad_target = OsStr::from_bytes(b"no\xffutf8");
+        std::os::unix::fs::symlink(bad_target, &bad).unwrap();
+        let list = dir.path().join("list.txt");
+        fs::write(
+            &list,
+            format!("{}\n{}\n", bad.display(), keep.display()),
+        )
+        .unwrap();
+        let (entries, stats) =
+            collect_from_files_from(&list, &RuleSet::new(), false).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].archive_name, "keep.txt");
+        assert_eq!(stats.skipped_special, 1);
     }
 }

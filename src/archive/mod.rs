@@ -6,6 +6,17 @@ pub mod tar_common;
 pub mod tar_lz4;
 pub mod tar_zstd;
 
+/// Per-encode outcome for create writers (after selection).
+///
+/// `members_written` counts selected content members that were archived
+/// (files / symlinks / hard links). Parent directory stubs on tar formats are
+/// not counted here. `skipped_vanished` is soft-skipped at open/encode.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CreateWriteStats {
+    pub members_written: u64,
+    pub skipped_vanished: u64,
+}
+
 pub use seekable_zstd::{
     extract_member, extract_member_bytes, list_members, verify_archive as verify_seekable_zstd,
     write_seekable_zstd, MemberIndex, MemberIndexEntry, DEFAULT_FRAME_SIZE, INDEX_MAGIC,

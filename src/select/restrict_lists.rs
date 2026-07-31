@@ -31,7 +31,6 @@ use super::walk::{SelectedEntry, SelectionStats};
 use crate::error::{Error, Result};
 use crate::util::parse_byte_size;
 use std::path::Path;
-use tracing::warn;
 
 /// One file-size restriction: rsync-style pattern + max size.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,12 +113,10 @@ pub fn load_file_size_from(path: &Path) -> Result<Vec<FileSizeRule>> {
         match parse_file_size_line(trimmed) {
             Ok(rule) => out.push(rule),
             Err(e) => {
-                warn!(
-                    file = %path.display(),
-                    line = idx + 1,
-                    error = %e,
-                    text = %trimmed,
-                    "ignoring invalid --file-size-from line"
+                crate::util::soft_skip_note_detail(
+                    crate::util::SoftKind::Config,
+                    &format!("file-size L{}", idx + 1),
+                    Some(&e.to_string()),
                 );
             }
         }
@@ -301,23 +298,19 @@ pub fn load_dir_max_size_from(
         let parsed = match parse_dir_restrict_line(trimmed) {
             Ok(p) => p,
             Err(e) => {
-                warn!(
-                    file = %path.display(),
-                    line = idx + 1,
-                    error = %e,
-                    text = %trimmed,
-                    "ignoring invalid --dir-max-size-from line"
+                crate::util::soft_skip_note_detail(
+                    crate::util::SoftKind::Config,
+                    &format!("dir-size L{}", idx + 1),
+                    Some(&e.to_string()),
                 );
                 continue;
             }
         };
         if let Some(limit) = parsed.max_size {
             if budgets.iter().any(|b| b.prefix == parsed.prefix) {
-                warn!(
-                    file = %path.display(),
-                    line = idx + 1,
-                    prefix = %parsed.prefix,
-                    "ignoring duplicate dir-max-size prefix"
+                crate::util::soft_skip_note(
+                    crate::util::SoftKind::Config,
+                    &format!("dup size {}", parsed.prefix),
                 );
             } else {
                 budgets.push(DirBudget {
@@ -328,11 +321,9 @@ pub fn load_dir_max_size_from(
         }
         if let Some(max_count) = parsed.max_files {
             if file_limits.iter().any(|f| f.prefix == parsed.prefix) {
-                warn!(
-                    file = %path.display(),
-                    line = idx + 1,
-                    prefix = %parsed.prefix,
-                    "ignoring duplicate dir-max-files prefix"
+                crate::util::soft_skip_note(
+                    crate::util::SoftKind::Config,
+                    &format!("dup files {}", parsed.prefix),
                 );
             } else {
                 file_limits.push(DirFileLimit {
@@ -361,22 +352,18 @@ pub fn load_dir_max_files_from_ext(
         let lim = match parse_dir_file_limit_line(trimmed) {
             Ok(l) => l,
             Err(e) => {
-                warn!(
-                    file = %path.display(),
-                    line = idx + 1,
-                    error = %e,
-                    text = %trimmed,
-                    "ignoring invalid --dir-max-files-from line"
+                crate::util::soft_skip_note_detail(
+                    crate::util::SoftKind::Config,
+                    &format!("dir-files L{}", idx + 1),
+                    Some(&e.to_string()),
                 );
                 continue;
             }
         };
         if existing.iter().any(|x| x.prefix == lim.prefix) {
-            warn!(
-                file = %path.display(),
-                line = idx + 1,
-                prefix = %lim.prefix,
-                "ignoring duplicate --dir-max-files prefix"
+            crate::util::soft_skip_note(
+                crate::util::SoftKind::Config,
+                &format!("dup files {}", lim.prefix),
             );
             continue;
         }

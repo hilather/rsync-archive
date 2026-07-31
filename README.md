@@ -109,8 +109,11 @@ Optional denser codecs: `cargo build --features native-codecs` (`liblzma` LZMA2 
 Default create remains **non-solid 7z** with **`--method lzma2`**.
 
 **Trailing `/` on SRC** strips the directory name from archive paths (`photos/` → `a.jpg`; `photos` → `photos/a.jpg`).  
-**`--files-from`:** exclusive of `SRC...`; relative lines keep path as member name; absolute lines use basename.  
+**`--files-from`:** exclusive of `SRC...`; relative lines keep path as member name; absolute lines use basename. With **`--files-from-skip-missing`**, missing/unreadable list lines are soft-skipped (default hard-fails).  
 **`--include-cwd`:** (off by default) pack files under the process CWD at **archive root** (like a trailing `/` on `.`); skips `-o` / `.partial`. **Ignores rsync filters** (filters apply to SRC/`--files-from` only). May be used alone or with `SRC...` / `--files-from`.  
+**Multi-SRC missing roots:** when ≥2 `SRC...` args (or SRC + `--include-cwd`), a missing/inaccessible root is soft-skipped; a single missing SRC alone hard-fails.  
+
+**Live-tree races / soft-skip:** members that vanish or become unreadable **between selection and open** are omitted (counted as `vanished at encode`); remaining members still archive. **7z** also soft-skips mid-read vanish with pack rollback (parallel encodes to memory first). **tar / seekable-zstd** re-stat size after open; short mid-read is **zero-padded** with a stderr warning (structurally valid; content may be truncated). If **all** selected members soft-skip, create errors unless **`--allow-empty`** (exit 0, no `-o`). Empty selection is the same. Details: [`docs/SELECTION.md`](docs/SELECTION.md#encode-soft-skip--live-tree-races).  
 
 **Filters:** see [`docs/SELECTION.md`](docs/SELECTION.md) and [`docs/RSYNC_PARITY.md`](docs/RSYNC_PARITY.md). Rule build order: `include-from` → `exclude-from` → **`filter-from`** → `--filter` → `--include` → `--exclude`. Prefer **`--filter-from`** / `--filter` for ordered mixes (`--include`/`--exclude` are batched, not CLI-interleaved).  
 **Restriction list files** (only matching paths/prefixes; others ignore that list):  
@@ -154,6 +157,7 @@ Default naming flattens to **basename**. Missing 7z magic **warns** (stderr log)
 | `--exclude-from` / `--include-from` | — | Pattern files (repeatable) |
 | `--filter-from` | — | Ordered `+/-` filter file (repeatable; preferred for full rule lists) |
 | `--files-from` | — | Master collect list (exclusive of `SRC...`) |
+| `--files-from-skip-missing` | off | Soft-skip missing/unreadable `--files-from` lines (default: hard-fail) |
 | `--include-cwd` | off | Pack CWD files at archive root; skip `-o` / `.partial` |
 | `--file-size-from` | — | Per-path max size list (`PATTERN max=SIZE`; only matches) |
 | `--dir-max-size-from` | — | Dir size/count list (`DIR/ max=SIZE [files=N]`) |
@@ -172,6 +176,7 @@ Default naming flattens to **basename**. Missing 7z magic **warns** (stderr log)
 | `--max-size` | — | Skip any single file larger than SIZE |
 | `--min-size` | — | Skip files smaller than SIZE (`0` = off) |
 | `--newer-than` | — | Only files with mtime within last DURATION (`7d`, `24h`, `30m`, `90s`) |
+| `--allow-empty` | off | Empty selection or all encode soft-skips → exit 0, no `-o` (default: error) |
 | `SRC...` | — | Sources (required unless `--files-from`) |
 
 ### `embed`
@@ -284,8 +289,8 @@ Docs: [`docs/BENCH.md`](docs/BENCH.md) · published numbers: [`docs/bench/RESULT
 
 ```bash
 # Cut a release (maintainers)
-git tag -a v0.5.2 -m "v0.5.2"
-git push origin v0.5.2
+git tag -a v0.5.3 -m "v0.5.3"
+git push origin v0.5.3
 
 # Install from a release asset
 tar -xzf rsync-archive-rocky8-x86_64.tar.gz

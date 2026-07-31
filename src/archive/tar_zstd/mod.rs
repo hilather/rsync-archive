@@ -5,6 +5,13 @@
 //!
 //! Uncompressed payload = POSIX ustar/pax tar stream + trailing member index.
 //! Wrapped in Zstd **seekable** frames via [`zeekstd`].
+//!
+//! **Soft-fail create:** skippable open errors skip the member (other members
+//! still written). After open, size is taken from post-open metadata (not
+//! selection). If the file shrinks or a skippable read error occurs after the
+//! tar header is committed, the remainder is **zero-padded** so the archive
+//! stays valid; a warn is logged. Growing files are capped at the post-open
+//! size. If every selected member is skipped, returns [`Error::EmptyArchive`].
 
 use crate::archive::tar_common::{
     build_tar_headers, dir_meta_for_entry, encode_index, parent_dir_names, parse_index,
@@ -35,7 +42,20 @@ fn zstd_level(level: u32) -> i32 {
 /// in `RATAIDX1` with `data_len = 0`. Symlinks use typeflag `'2'` and hard links
 /// typeflag `'1'`, both with no data body. Empty dirs with no selected members
 /// are not added.
-pub fn write_tar_zstd(path: &Path, entries: &[SelectedEntry], level: u32) -> Result<()> {
+///
+/// Regular files: open → re-stat for size → write header → stream exactly that
+/// many bytes (pad zeros on early EOF / skippable mid-read). Soft-skip only on
+/// skippable open failure. See module docs.
+///
+/// Returns [`CreateWriteStats`]; `members_written == 0` means no content members
+/// were archived (caller handles empty / all-vanished; partial is left for cleanup).
+pub fn write_tar_zstd(
+    path: &Path,
+    entries: &[SelectedEntry],
+    level: u32,
+) -> Result<crate::archive::CreateWriteStats> {
+    use crate::archive::CreateWriteStats;
+
     if entries.is_empty() {
         return Err(Error::EmptyArchive);
     }
@@ -56,9 +76,60 @@ pub fn write_tar_zstd(path: &Path, entries: &[SelectedEntry], level: u32) -> Res
     let mut index_entries: Vec<TarMemberIndexEntry> =
         Vec::with_capacity(crate::archive::tar_common::expected_tar_member_count(entries));
     let mut emitted_dirs: HashSet<String> = HashSet::new();
+    // File members successfully written (archive names). Hard links whose
+    // target was soft-skipped must not be emitted as dangling typeflag '1'.
+    let mut written_files: HashSet<String> = HashSet::new();
     let mut pos: u64 = 0;
+    let mut stats = CreateWriteStats::default();
 
     for e in entries {
+        let mode = e.mode;
+        let mtime = e.mtime_unix.unwrap_or(0);
+        let has_body = e.has_data_body();
+
+        // Drop hard-link members whose File target never made it into the archive
+        // (e.g. body vanished at open). Prevents dangling typeflag '1' members.
+        if e.is_hard_link() {
+            let target = e.link_target().unwrap_or("");
+            if !written_files.contains(target) {
+                crate::util::soft_skip_note(
+                    crate::util::SoftKind::Hardlink,
+                    &e.archive_name,
+                );
+                stats.skipped_vanished += 1;
+                continue;
+            }
+        }
+
+        // Open + re-stat before dirs/header so a vanished path skips cleanly.
+        // EINTR is retried inside open_file_for_encode (not soft-skipped).
+        let (mut body_file, data_len) = if has_body {
+            match crate::util::open_file_for_encode(&e.abs_path) {
+                Ok(f) => {
+                    let actual = f
+                        .metadata()
+                        .map(|m| m.len())
+                        .unwrap_or(e.size);
+                    if actual > 0 {
+                        (Some(f), actual)
+                    } else {
+                        (None, 0)
+                    }
+                }
+                Err(Error::Vanished(_)) => {
+                    crate::util::soft_skip_note(
+                        crate::util::SoftKind::Vanished,
+                        &e.archive_name,
+                    );
+                    stats.skipped_vanished += 1;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            (None, 0)
+        };
+
         // Emit unique parent directory members (root-first) before the file.
         for dir_name in parent_dir_names(&e.archive_name) {
             if !emitted_dirs.insert(dir_name.clone()) {
@@ -90,35 +161,6 @@ pub fn write_tar_zstd(path: &Path, entries: &[SelectedEntry], level: u32) -> Res
             );
         }
 
-        let mode = e.mode;
-        let mtime = e.mtime_unix.unwrap_or(0);
-        let has_body = e.has_data_body();
-        let data_len = if has_body { e.size } else { 0 };
-
-        // Open file body first so a vanished path skips the whole member (no orphan header).
-        let mut body_file = if has_body && data_len > 0 {
-            match File::open(&e.abs_path) {
-                Ok(f) => Some(f),
-                Err(err) if crate::util::is_skippable_fs_io(&err) => {
-                    tracing::warn!(
-                        path = %e.abs_path.display(),
-                        name = %e.archive_name,
-                        error = %err,
-                        "skip vanished or inaccessible file in tar.zst"
-                    );
-                    continue;
-                }
-                Err(err) => {
-                    return Err(Error::Archive(format!(
-                        "open {} for tar.zst: {err}",
-                        e.abs_path.display()
-                    )));
-                }
-            }
-        } else {
-            None
-        };
-
         let header_offset = pos;
         let meta = TarMemberMeta {
             size: data_len,
@@ -139,25 +181,15 @@ pub fn write_tar_zstd(path: &Path, entries: &[SelectedEntry], level: u32) -> Res
             .ok_or_else(|| Error::Archive("tar offset overflow".into()))?;
 
         let data_offset = pos;
-        let written = if let Some(ref mut f) = body_file {
-            let n = stream_reader_into_encoder(&mut encoder, f, e.size, &e.abs_path)?;
-            if n != e.size {
-                return Err(Error::Archive(format!(
-                    "size changed while archiving {}: expected {}, wrote {n}",
-                    e.abs_path.display(),
-                    e.size
-                )));
-            }
-            n
-        } else {
-            0u64
-        };
+        if let Some(ref mut f) = body_file {
+            stream_reader_exact_or_pad(&mut encoder, f, data_len, &e.abs_path)?;
+        }
         pos = pos
-            .checked_add(written)
+            .checked_add(data_len)
             .ok_or_else(|| Error::Archive("tar offset overflow".into()))?;
 
         // Pad file data to 512-byte boundary.
-        let pad = (512 - (written % 512)) % 512;
+        let pad = (512 - (data_len % 512)) % 512;
         if pad > 0 {
             write_all_encoded(&mut encoder, &[0u8; 512][..pad as usize])?;
             pos = pos
@@ -175,6 +207,10 @@ pub fn write_tar_zstd(path: &Path, entries: &[SelectedEntry], level: u32) -> Res
             uid: e.uid,
             gid: e.gid,
         });
+        stats.members_written += 1;
+        if has_body {
+            written_files.insert(e.archive_name.clone());
+        }
 
         debug!(
             name = %e.archive_name,
@@ -185,6 +221,12 @@ pub fn write_tar_zstd(path: &Path, entries: &[SelectedEntry], level: u32) -> Res
             is_hard_link = e.is_hard_link(),
             "tar.zst member written"
         );
+    }
+
+    if stats.members_written == 0 {
+        // Leave partial for caller cleanup; surface all-vanished via stats.
+        drop(encoder);
+        return Ok(stats);
     }
 
     // End-of-archive: two 512-byte zero blocks.
@@ -202,7 +244,7 @@ pub fn write_tar_zstd(path: &Path, entries: &[SelectedEntry], level: u32) -> Res
     encoder
         .finish()
         .map_err(|e| Error::Compress(format!("tar.zst finish: {e}")))?;
-    Ok(())
+    Ok(stats)
 }
 
 fn write_all_encoded<W: Write>(encoder: &mut Encoder<'_, W>, mut data: &[u8]) -> Result<()> {
@@ -220,35 +262,61 @@ fn write_all_encoded<W: Write>(encoder: &mut Encoder<'_, W>, mut data: &[u8]) ->
     Ok(())
 }
 
-fn stream_reader_into_encoder<W: Write, R: Read>(
+/// Stream exactly `declared_len` bytes. Cap at that length (ignore growth).
+/// Early EOF or skippable mid-read: pad zeros for the remainder and warn so the
+/// tar member size matches the committed header.
+fn stream_reader_exact_or_pad<W: Write, R: Read>(
     encoder: &mut Encoder<'_, W>,
     f: &mut R,
-    expected_len: u64,
+    declared_len: u64,
     path: &Path,
-) -> Result<u64> {
+) -> Result<()> {
     let mut buf = vec![0u8; 128 * 1024];
-    let mut total = 0u64;
-    loop {
-        let n = f.read(&mut buf).map_err(|e| {
-            if crate::util::is_skippable_fs_io(&e) {
-                Error::Vanished(path.to_path_buf())
-            } else {
-                Error::Archive(format!("read {} for tar.zst: {e}", path.display()))
+    let mut remaining = declared_len;
+    while remaining > 0 {
+        let chunk = remaining.min(buf.len() as u64) as usize;
+        let n = match crate::util::read_retrying(f, &mut buf[..chunk]) {
+            Ok(0) => {
+                let got = declared_len - remaining;
+                crate::util::soft_skip_note_detail(
+                    crate::util::SoftKind::Padded,
+                    &path.display().to_string(),
+                    Some(&format!("eof got={got}/{declared_len}")),
+                );
+                write_zeros_encoded(encoder, remaining)?;
+                return Ok(());
             }
-        })?;
-        if n == 0 {
-            break;
-        }
+            Ok(n) => n,
+            Err(e) if crate::util::is_skippable_fs_io(&e) => {
+                crate::util::soft_skip_note_detail(
+                    crate::util::SoftKind::Padded,
+                    &path.display().to_string(),
+                    Some(&format!("io rem={remaining}: {e}")),
+                );
+                write_zeros_encoded(encoder, remaining)?;
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(Error::Archive(format!(
+                    "read {} for tar.zst: {e}",
+                    path.display()
+                )));
+            }
+        };
         write_all_encoded(encoder, &buf[..n])?;
-        total = total.saturating_add(n as u64);
-        if total > expected_len {
-            return Err(Error::Archive(format!(
-                "file grew while archiving {}: expected at most {expected_len}",
-                path.display()
-            )));
-        }
+        remaining -= n as u64;
     }
-    Ok(total)
+    Ok(())
+}
+
+fn write_zeros_encoded<W: Write>(encoder: &mut Encoder<'_, W>, mut n: u64) -> Result<()> {
+    let zero = [0u8; 4096];
+    while n > 0 {
+        let take = n.min(zero.len() as u64) as usize;
+        write_all_encoded(encoder, &zero[..take])?;
+        n -= take as u64;
+    }
+    Ok(())
 }
 
 /// List members from a tar.zst archive (index-based; no full decompress).

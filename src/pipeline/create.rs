@@ -11,7 +11,9 @@
 use crate::archive::sevenz::{
     compress_path_with_size, filetime_from_unix_secs, CompressedPack, CompressMethod,
 };
-use crate::archive::{write_seekable_zstd, write_tar_lz4, write_tar_zstd, NonsolidLzma2Writer};
+use crate::archive::{
+    write_seekable_zstd, write_tar_lz4, write_tar_zstd, CreateWriteStats, NonsolidLzma2Writer,
+};
 use crate::cli::{CreateArgs, OutputFormat};
 use crate::error::{Error, Result};
 use crate::pipeline::output::{
@@ -27,12 +29,14 @@ use crate::select::global_restrict::{
 };
 use crate::select::restrict_lists::{apply_file_size_from, load_file_size_from};
 use crate::select::walk::{
-    collect_from_files_from, collect_from_sources, MemberKind, SelectedEntry, SelectionStats,
+    collect_from_files_from, collect_from_sources, filter_hardlinks_without_targets, MemberKind,
+    SelectedEntry, SelectionStats,
 };
 use crate::select::{RuleSet, SourceSpec};
 use crate::util::{
-    can_admit, file_stats_from_sizes, parse_byte_size, resolve_encode_concurrency,
-    resolve_encode_workers,
+    can_admit, file_stats_from_sizes, is_skippable_fs_io, parse_byte_size,
+    resolve_encode_concurrency, resolve_encode_workers, soft_skip_flush_stderr, soft_skip_note,
+    soft_skip_note_detail, soft_skip_reset, SoftKind,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -96,13 +100,32 @@ pub fn build_selection(
 ) -> Result<(Vec<SelectedEntry>, SelectionStats, RestrictionReport)> {
     let rules = build_rules(args)?;
     let (mut entries, mut stats) = if let Some(list) = &args.files_from {
-        collect_from_files_from(list, &rules)?
+        collect_from_files_from(list, &rules, args.files_from_skip_missing)?
     } else if !args.sources.is_empty() {
+        // Multi-SRC (or SRC + --include-cwd): soft-skip missing roots; single
+        // missing SRC alone still hard-fails (misconfiguration).
+        let allow_skip_missing_src = args.sources.len() > 1 || args.include_cwd;
         let mut specs = Vec::with_capacity(args.sources.len());
+        let mut missing_src = 0u64;
         for s in &args.sources {
-            specs.push(SourceSpec::from_user_path(s)?);
+            match SourceSpec::from_user_path(s) {
+                Ok(spec) => specs.push(spec),
+                Err(e) if allow_skip_missing_src && source_path_skippable_missing(s) => {
+                    missing_src += 1;
+                    soft_skip_note_detail(SoftKind::MissingSrc, s, Some(&e.to_string()));
+                }
+                Err(e) => return Err(e),
+            }
         }
-        collect_from_sources(&specs, &rules)?
+        if specs.is_empty() {
+            let mut st = SelectionStats::default();
+            st.skipped_missing_src = missing_src;
+            (Vec::new(), st)
+        } else {
+            let (entries, mut st) = collect_from_sources(&specs, &rules)?;
+            st.skipped_missing_src = st.skipped_missing_src.saturating_add(missing_src);
+            (entries, st)
+        }
     } else {
         (Vec::new(), SelectionStats::default())
     };
@@ -220,6 +243,24 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// True when `user_src` is missing/unreadable with skippable I/O (NotFound, EACCES, …).
+///
+/// Used for multi-SRC soft-skip; re-stats after `from_user_path` failed so we only
+/// soft-skip genuine FS absence/permission issues (not trailing-slash-on-file etc.).
+fn source_path_skippable_missing(user_src: &str) -> bool {
+    let trimmed = user_src.trim_end_matches(['/', '\\']);
+    let path = if trimmed.is_empty() {
+        // "/" only — keep as root path
+        std::path::Path::new(if cfg!(windows) { "\\" } else { "/" })
+    } else {
+        std::path::Path::new(trimmed)
+    };
+    match std::fs::symlink_metadata(path) {
+        Err(e) => is_skippable_fs_io(&e),
+        Ok(_) => false,
+    }
+}
+
 /// Append `extra` into `base`, merging stats; collision on archive_name errors.
 fn merge_selection(
     base: &mut Vec<SelectedEntry>,
@@ -248,6 +289,17 @@ fn merge_selection(
     base_stats.skipped_special = base_stats
         .skipped_special
         .saturating_add(extra_stats.skipped_special);
+    base_stats.skipped_files_from_missing = base_stats
+        .skipped_files_from_missing
+        .saturating_add(extra_stats.skipped_files_from_missing);
+    base_stats.skipped_missing_src = base_stats
+        .skipped_missing_src
+        .saturating_add(extra_stats.skipped_missing_src);
+    base_stats.skipped_vanished = base_stats
+        .skipped_vanished
+        .saturating_add(extra_stats.skipped_vanished);
+    // Other restriction counters (dir budget, max-size, …) are applied after merge
+    // on the combined list; only walk-time skip fields need merging here.
     Ok(())
 }
 
@@ -303,15 +355,31 @@ fn filter_entries_for_format(
 /// skip them (counted in `skipped_symlinks` / `skipped_hardlinks`), keeping only
 /// the first regular-file body for each hard-linked inode.
 pub fn run_create(args: CreateArgs) -> Result<()> {
+    soft_skip_reset();
     let format = args.resolved_format();
     let (entries, mut stats, restrictions) = build_selection(&args)?;
     let entries = filter_entries_for_format(format, entries, &mut stats);
+    // Drop HardLink members whose File target is absent (safety net; normal
+    // selection always has the target. Encode soft-skip of a body may need a
+    // second pass at write time — see filter_hardlinks_without_targets).
+    let before_hl = entries.len();
+    let entries = filter_hardlinks_without_targets(entries);
+    let dropped_hl = before_hl.saturating_sub(entries.len());
+    if dropped_hl > 0 {
+        stats.skipped_hardlinks = stats.skipped_hardlinks.saturating_add(dropped_hl as u64);
+        stats.selected = entries.len() as u64;
+        soft_skip_note(
+            SoftKind::Hardlink,
+            &format!("pre-encode x{dropped_hl}"),
+        );
+    }
 
     if args.dry_run {
         for e in &entries {
             println!("{}", e.archive_name);
         }
         restrictions.eprint_compact();
+        soft_skip_flush_stderr();
         print_selection_summary(&stats, true);
         info!(
             format = format.as_str(),
@@ -328,6 +396,9 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
             skipped_symlinks = stats.skipped_symlinks,
             skipped_hardlinks = stats.skipped_hardlinks,
             skipped_special = stats.skipped_special,
+            skipped_files_from_missing = stats.skipped_files_from_missing,
+            skipped_missing_src = stats.skipped_missing_src,
+            skipped_vanished = stats.skipped_vanished,
             "create dry-run complete"
         );
         return Ok(());
@@ -336,24 +407,85 @@ pub fn run_create(args: CreateArgs) -> Result<()> {
     if entries.is_empty() {
         // Still emit restriction report so operators see why nothing was kept.
         restrictions.eprint_compact();
+        soft_skip_flush_stderr();
         print_selection_summary(&stats, false);
+        if args.allow_empty {
+            eprintln!(
+                "warning: empty selection; no archive written (--allow-empty)"
+            );
+            info!(
+                path = %args.output.display(),
+                "create skipped empty selection (--allow-empty)"
+            );
+            return Ok(());
+        }
         return Err(Error::EmptyArchive);
     }
 
     match format {
-        OutputFormat::SevenZ => run_create_sevenz(&args, &entries, &stats, &restrictions),
+        OutputFormat::SevenZ => run_create_sevenz(&args, &entries, stats, &restrictions),
         OutputFormat::SeekableZstd => {
-            run_create_seekable_zstd(&args, &entries, &stats, &restrictions)
+            run_create_seekable_zstd(&args, &entries, stats, &restrictions)
         }
-        OutputFormat::TarZstd => run_create_tar_zstd(&args, &entries, &stats, &restrictions),
-        OutputFormat::TarLz4 => run_create_tar_lz4(&args, &entries, &stats, &restrictions),
+        OutputFormat::TarZstd => run_create_tar_zstd(&args, &entries, stats, &restrictions),
+        OutputFormat::TarLz4 => run_create_tar_lz4(&args, &entries, stats, &restrictions),
     }
+}
+
+/// Merge encode soft-skip counts into selection stats; fail or allow when nothing written.
+fn finish_create_write(
+    args: &CreateArgs,
+    paths: &crate::pipeline::output::OutputPaths,
+    selected_count: usize,
+    mut stats: SelectionStats,
+    write_stats: CreateWriteStats,
+    restrictions: &RestrictionReport,
+    success_msg: impl FnOnce(u64) -> String,
+) -> Result<()> {
+    stats.skipped_vanished = stats
+        .skipped_vanished
+        .saturating_add(write_stats.skipped_vanished);
+
+    if write_stats.members_written == 0 {
+        cleanup_partial(paths);
+        restrictions.eprint_compact();
+        soft_skip_flush_stderr();
+        print_selection_summary(&stats, false);
+        if args.allow_empty {
+            eprintln!(
+                "warning: all {selected_count} selected members soft-skipped at encode; no archive written (--allow-empty)"
+            );
+            info!(
+                selected = selected_count,
+                skipped_vanished = stats.skipped_vanished,
+                "create skipped all-vanished at encode (--allow-empty)"
+            );
+            return Ok(());
+        }
+        return Err(Error::Message(format!(
+            "all {selected_count} selected members vanished or inaccessible at encode"
+        )));
+    }
+
+    commit_output(paths)?;
+    restrictions.eprint_compact();
+    soft_skip_flush_stderr();
+    print_selection_summary(&stats, false);
+    let msg = success_msg(write_stats.members_written);
+    info!(
+        path = %paths.final_path.display(),
+        written = write_stats.members_written,
+        skipped_vanished = stats.skipped_vanished,
+        "create complete"
+    );
+    eprintln!("{msg}");
+    Ok(())
 }
 
 fn run_create_sevenz(
     args: &CreateArgs,
     entries: &[SelectedEntry],
-    stats: &SelectionStats,
+    stats: SelectionStats,
     restrictions: &RestrictionReport,
 ) -> Result<()> {
     let t0 = Instant::now();
@@ -410,42 +542,41 @@ fn run_create_sevenz(
         size_budget,
         zstd_nb_workers,
     ) {
-        Ok(()) => {
+        Ok(write_stats) => {
             let encode_ms = t_enc.elapsed().as_millis();
-            commit_output(&paths)?;
-            restrictions.eprint_compact();
-            print_selection_summary(stats, false);
-            if timings_enabled() {
-                eprintln!(
-                    "timings: total={}ms encode={}ms members={} concurrency={}",
-                    t0.elapsed().as_millis(),
-                    encode_ms,
-                    entries.len(),
-                    concurrency
-                );
-            }
-            info!(
-                path = %paths.final_path.display(),
-                count = entries.len(),
-                level = args.level,
-                method = method.as_str(),
-                concurrency,
-                "create complete"
-            );
-            eprintln!(
-                "created {} member(s) → {} (format 7z, method {}, concurrency {})",
+            let written = write_stats.members_written;
+            let method_s = method.as_str().to_string();
+            let out_disp = paths.final_path.display().to_string();
+            finish_create_write(
+                args,
+                &paths,
                 entries.len(),
-                paths.final_path.display(),
-                method.as_str(),
-                concurrency
-            );
-            if args.verify {
-                verify_create_archive(&paths.final_path, entries.len())?;
+                stats,
+                write_stats,
+                restrictions,
+                |w| {
+                    format!(
+                        "created {w} member(s) → {out_disp} (format 7z, method {method_s}, concurrency {concurrency})"
+                    )
+                },
+            )?;
+            if written > 0 {
+                if timings_enabled() {
+                    eprintln!(
+                        "timings: total={}ms encode={}ms members={written} concurrency={concurrency}",
+                        t0.elapsed().as_millis(),
+                        encode_ms,
+                    );
+                }
+                if args.verify {
+                    verify_create_archive(&paths.final_path, written as usize)?;
+                }
             }
             Ok(())
         }
         Err(e) => {
             cleanup_partial(&paths);
+            soft_skip_flush_stderr();
             Err(e)
         }
     }
@@ -458,7 +589,7 @@ fn timings_enabled() -> bool {
 fn run_create_tar_zstd(
     args: &CreateArgs,
     entries: &[SelectedEntry],
-    stats: &SelectionStats,
+    stats: SelectionStats,
     restrictions: &RestrictionReport,
 ) -> Result<()> {
     info!(
@@ -470,33 +601,37 @@ fn run_create_tar_zstd(
 
     let paths = prepare_output(&args.output, args.force)?;
     match write_tar_zstd(&paths.partial_path, entries, args.level) {
-        Ok(()) => {
-            commit_output(&paths)?;
-            restrictions.eprint_compact();
-            print_selection_summary(stats, false);
-            let member_count =
-                crate::archive::tar_common::expected_tar_member_count(entries);
-            info!(
-                path = %paths.final_path.display(),
-                file_count = entries.len(),
-                member_count,
-                level = args.level,
-                "create tar.zst complete"
-            );
-            eprintln!(
-                "created {member_count} member(s) ({} file(s)) → {} (format tar-zstd, level {})",
+        Ok(write_stats) => {
+            let written = write_stats.members_written;
+            let out_disp = paths.final_path.display().to_string();
+            let level = args.level;
+            finish_create_write(
+                args,
+                &paths,
                 entries.len(),
-                paths.final_path.display(),
-                args.level
-            );
-            if args.verify {
-                crate::archive::verify_tar_zstd(&paths.final_path, member_count)?;
-                eprintln!("verify ok: {member_count} member(s), tar-zstd");
+                stats,
+                write_stats,
+                restrictions,
+                move |w| {
+                    format!(
+                        "created {w} content member(s) → {out_disp} (format tar-zstd, level {level})"
+                    )
+                },
+            )?;
+            if written > 0 && args.verify {
+                // List actual index length after soft-skips (parent dirs included).
+                let listed = crate::archive::list_tar_zstd_members(&paths.final_path)?;
+                crate::archive::verify_tar_zstd(&paths.final_path, listed.members.len())?;
+                eprintln!(
+                    "verify ok: {} member(s), tar-zstd",
+                    listed.members.len()
+                );
             }
             Ok(())
         }
         Err(e) => {
             cleanup_partial(&paths);
+            soft_skip_flush_stderr();
             Err(e)
         }
     }
@@ -505,7 +640,7 @@ fn run_create_tar_zstd(
 fn run_create_tar_lz4(
     args: &CreateArgs,
     entries: &[SelectedEntry],
-    stats: &SelectionStats,
+    stats: SelectionStats,
     restrictions: &RestrictionReport,
 ) -> Result<()> {
     info!(
@@ -517,33 +652,36 @@ fn run_create_tar_lz4(
 
     let paths = prepare_output(&args.output, args.force)?;
     match write_tar_lz4(&paths.partial_path, entries, args.level) {
-        Ok(()) => {
-            commit_output(&paths)?;
-            restrictions.eprint_compact();
-            print_selection_summary(stats, false);
-            let member_count =
-                crate::archive::tar_common::expected_tar_member_count(entries);
-            info!(
-                path = %paths.final_path.display(),
-                file_count = entries.len(),
-                member_count,
-                level = args.level,
-                "create tar.lz4 complete"
-            );
-            eprintln!(
-                "created {member_count} member(s) ({} file(s)) → {} (format tar-lz4, level {})",
+        Ok(write_stats) => {
+            let written = write_stats.members_written;
+            let out_disp = paths.final_path.display().to_string();
+            let level = args.level;
+            finish_create_write(
+                args,
+                &paths,
                 entries.len(),
-                paths.final_path.display(),
-                args.level
-            );
-            if args.verify {
-                crate::archive::verify_tar_lz4(&paths.final_path, member_count)?;
-                eprintln!("verify ok: {member_count} member(s), tar-lz4");
+                stats,
+                write_stats,
+                restrictions,
+                move |w| {
+                    format!(
+                        "created {w} content member(s) → {out_disp} (format tar-lz4, level {level})"
+                    )
+                },
+            )?;
+            if written > 0 && args.verify {
+                let listed = crate::archive::list_tar_lz4_members(&paths.final_path)?;
+                crate::archive::verify_tar_lz4(&paths.final_path, listed.members.len())?;
+                eprintln!(
+                    "verify ok: {} member(s), tar-lz4",
+                    listed.members.len()
+                );
             }
             Ok(())
         }
         Err(e) => {
             cleanup_partial(&paths);
+            soft_skip_flush_stderr();
             Err(e)
         }
     }
@@ -552,7 +690,7 @@ fn run_create_tar_lz4(
 fn run_create_seekable_zstd(
     args: &CreateArgs,
     entries: &[SelectedEntry],
-    stats: &SelectionStats,
+    stats: SelectionStats,
     restrictions: &RestrictionReport,
 ) -> Result<()> {
     info!(
@@ -564,33 +702,32 @@ fn run_create_seekable_zstd(
 
     let paths = prepare_output(&args.output, args.force)?;
     match write_seekable_zstd(&paths.partial_path, entries, args.level) {
-        Ok(()) => {
-            commit_output(&paths)?;
-            restrictions.eprint_compact();
-            print_selection_summary(stats, false);
-            info!(
-                path = %paths.final_path.display(),
-                count = entries.len(),
-                level = args.level,
-                "create seekable-zstd complete"
-            );
-            eprintln!(
-                "created {} member(s) → {} (format seekable-zstd, level {})",
+        Ok(write_stats) => {
+            let written = write_stats.members_written;
+            let out_disp = paths.final_path.display().to_string();
+            let level = args.level;
+            finish_create_write(
+                args,
+                &paths,
                 entries.len(),
-                paths.final_path.display(),
-                args.level
-            );
-            if args.verify {
-                crate::archive::verify_seekable_zstd(&paths.final_path, entries.len())?;
-                eprintln!(
-                    "verify ok: {} member(s), seekable-zstd",
-                    entries.len()
-                );
+                stats,
+                write_stats,
+                restrictions,
+                move |w| {
+                    format!(
+                        "created {w} member(s) → {out_disp} (format seekable-zstd, level {level})"
+                    )
+                },
+            )?;
+            if written > 0 && args.verify {
+                crate::archive::verify_seekable_zstd(&paths.final_path, written as usize)?;
+                eprintln!("verify ok: {written} member(s), seekable-zstd");
             }
             Ok(())
         }
         Err(e) => {
             cleanup_partial(&paths);
+            soft_skip_flush_stderr();
             Err(e)
         }
     }
@@ -612,7 +749,7 @@ fn write_create_archive(
     concurrency: usize,
     size_budget: u64,
     zstd_nb_workers: u32,
-) -> Result<()> {
+) -> Result<CreateWriteStats> {
     if concurrency <= 1 {
         let mut w = NonsolidLzma2Writer::create_with_method_workers(
             partial,
@@ -620,10 +757,20 @@ fn write_create_archive(
             method,
             zstd_nb_workers,
         )?;
+        let mut stats = CreateWriteStats::default();
         for e in entries {
-            w.push_entry(e)?;
+            if w.push_entry(e)? {
+                stats.members_written += 1;
+            } else {
+                stats.skipped_vanished += 1;
+            }
         }
-        return w.finish();
+        if stats.members_written == 0 {
+            // Avoid EmptyArchive from finish; leave partial for caller cleanup.
+            return Ok(stats);
+        }
+        w.finish()?;
+        return Ok(stats);
     }
 
     // OPT-01/02/05: fixed worker pool + completion-driven ordered streaming write.
@@ -638,13 +785,24 @@ fn encode_one(
     // OPT-03: use selection-time size/mtime; no re-stat.
     let mtime = entry.mtime_unix.map(filetime_from_unix_secs);
 
+    // Always probe open for empty files too — zero-byte vanish must soft-skip
+    // (no phantom empty member). EINTR is retried (not soft-skipped).
     if entry.size == 0 {
-        return Ok(Some(PreparedMember {
-            name: entry.archive_name.clone(),
-            mtime,
-            empty: true,
-            compressed: None,
-        }));
+        match crate::util::open_file_for_encode(&entry.abs_path) {
+            Ok(_) => {
+                return Ok(Some(PreparedMember {
+                    name: entry.archive_name.clone(),
+                    mtime,
+                    empty: true,
+                    compressed: None,
+                }));
+            }
+            Err(Error::Vanished(_)) => {
+                soft_skip_note(SoftKind::Vanished, &entry.archive_name);
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     // File-level workers: no extra zstd nbWorkers (avoid oversubscription).
@@ -655,11 +813,15 @@ fn encode_one(
             empty: false,
             compressed: Some(compressed),
         })),
-        Err(Error::Vanished(p)) => {
-            warn!(
-                path = %p.display(),
-                name = %entry.archive_name,
-                "skip vanished file at encode"
+        Err(Error::Vanished(_)) => {
+            soft_skip_note(SoftKind::Vanished, &entry.archive_name);
+            Ok(None)
+        }
+        Err(Error::Io(e)) if is_skippable_fs_io(&e) => {
+            soft_skip_note_detail(
+                SoftKind::Vanished,
+                &entry.archive_name,
+                Some(&e.to_string()),
             );
             Ok(None)
         }
@@ -687,7 +849,7 @@ fn write_create_parallel(
     method: CompressMethod,
     max_workers: usize,
     size_budget: u64,
-) -> Result<()> {
+) -> Result<CreateWriteStats> {
     let n = entries.len();
     if n == 0 {
         return Err(Error::EmptyArchive);
@@ -701,7 +863,7 @@ fn write_create_parallel(
     let (res_tx, res_rx) = mpsc::channel::<(usize, u64, Result<Option<PreparedMember>>)>();
     let panic_flag = Arc::new(AtomicBool::new(false));
 
-    thread::scope(|scope| -> Result<()> {
+    thread::scope(|scope| -> Result<CreateWriteStats> {
         for _ in 0..max_workers {
             let queue = Arc::clone(&queue);
             let res_tx = res_tx.clone();
@@ -736,11 +898,12 @@ fn write_create_parallel(
         }
         drop(res_tx); // workers hold the only remaining senders
 
-        let outcome = (|| -> Result<()> {
+        let outcome = (|| -> Result<CreateWriteStats> {
             let mut next_admit = 0usize;
             let mut next_write = 0usize;
             let mut running_sum = 0u64;
             let mut running_count = 0usize;
+            let mut stats = CreateWriteStats::default();
             // None = vanished/skipped at encode; still advances write order.
             let mut pending: BTreeMap<usize, Option<PreparedMember>> = BTreeMap::new();
 
@@ -813,17 +976,24 @@ fn write_create_parallel(
                         } else if let Some(c) = p.compressed {
                             writer.push_packed_with_mtime(p.name, c, p.mtime)?;
                         }
+                        stats.members_written += 1;
+                    } else {
+                        stats.skipped_vanished += 1;
                     }
                     next_write += 1;
                 }
             }
-            Ok(())
+            Ok(stats)
         })();
 
         shutdown_workers(&queue, max_workers);
         drop(res_rx);
-        outcome?;
-        writer.finish()
+        let stats = outcome?;
+        if stats.members_written == 0 {
+            return Ok(stats);
+        }
+        writer.finish()?;
+        Ok(stats)
     })
 }
 
@@ -899,22 +1069,29 @@ fn verify_create_archive(path: &Path, expected_files: usize) -> Result<()> {
 
 fn print_selection_summary(stats: &SelectionStats, dry_run: bool) {
     let mode = if dry_run { "dry-run" } else { "create" };
-    eprintln!(
-        "{mode}: {} selected, {} excluded, {} dir-budget skipped, {} dir-file-limit skipped, {} max-size skipped, {} file-size-from skipped, {} min-size skipped, {} older-than skipped, {} max-total-size skipped, {} max-files skipped, {} symlinks skipped, {} hardlinks skipped, {} special skipped",
-        stats.selected,
-        stats.skipped_excluded,
-        stats.skipped_dir_budget,
-        stats.skipped_dir_file_limit,
-        stats.skipped_max_size,
-        stats.skipped_file_size_from,
-        stats.skipped_min_size,
-        stats.skipped_older_than,
-        stats.skipped_max_total_size,
-        stats.skipped_max_files,
-        stats.skipped_symlinks,
-        stats.skipped_hardlinks,
-        stats.skipped_special
-    );
+    // Space-efficient: only non-zero skip counters (avoids a long all-zeros line).
+    let mut parts = vec![format!("{mode}: {} selected", stats.selected)];
+    let mut push = |n: u64, label: &str| {
+        if n > 0 {
+            parts.push(format!("{n} {label}"));
+        }
+    };
+    push(stats.skipped_excluded, "excluded");
+    push(stats.skipped_dir_budget, "dir-budget");
+    push(stats.skipped_dir_file_limit, "dir-files");
+    push(stats.skipped_max_size, "max-size");
+    push(stats.skipped_file_size_from, "file-size-from");
+    push(stats.skipped_min_size, "min-size");
+    push(stats.skipped_older_than, "older");
+    push(stats.skipped_max_total_size, "max-total");
+    push(stats.skipped_max_files, "max-files");
+    push(stats.skipped_symlinks, "symlinks");
+    push(stats.skipped_hardlinks, "hardlinks");
+    push(stats.skipped_special, "special");
+    push(stats.skipped_files_from_missing, "files-from-miss");
+    push(stats.skipped_missing_src, "missing-src");
+    push(stats.skipped_vanished, "vanished");
+    eprintln!("{}", parts.join(", "));
 }
 
 /// Helper for tests: parse sources preserving trailing slash via strings.
@@ -941,6 +1118,7 @@ pub(crate) fn test_create_args(
         exclude_from: vec![],
         include_from: vec![],
         files_from: None,
+        files_from_skip_missing: false,
         include_cwd: false,
         filter_from: vec![],
         filter: vec![],
@@ -960,6 +1138,7 @@ pub(crate) fn test_create_args(
         min_size: None,
         newer_than: None,
         verify: false,
+        allow_empty: false,
         sources,
     }
 }
@@ -1528,5 +1707,70 @@ mod tests {
         assert_eq!(entries[0].archive_name, "ok.bin");
         assert_eq!(stats.skipped_min_size, 1);
         assert_eq!(stats.skipped_older_than, 1);
+    }
+
+    #[test]
+    fn single_missing_src_hard_fails() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("no-such-src");
+        let args = test_create_args(
+            dir.path().join("out.7z"),
+            vec![missing.display().to_string()],
+        );
+        let err = build_selection(&args).unwrap_err();
+        assert!(
+            matches!(err, Error::Selection(_)),
+            "expected selection error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn multi_src_soft_skips_missing_root() {
+        let dir = tempdir().unwrap();
+        let keep = dir.path().join("keep");
+        fs::create_dir_all(&keep).unwrap();
+        fs::write(keep.join("a.txt"), b"a").unwrap();
+        let missing = dir.path().join("gone");
+        let args = test_create_args(
+            dir.path().join("out.7z"),
+            vec![
+                format!("{}/", missing.display()),
+                format!("{}/", keep.display()),
+            ],
+        );
+        let (entries, stats, _) = build_selection(&args).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].archive_name, "a.txt");
+        assert_eq!(stats.skipped_missing_src, 1);
+    }
+
+    #[test]
+    fn files_from_skip_missing_flag_wired() {
+        let dir = tempdir().unwrap();
+        let keep = dir.path().join("keep.txt");
+        fs::write(&keep, b"k").unwrap();
+        let list = dir.path().join("list.txt");
+        fs::write(
+            &list,
+            format!(
+                "{}\n{}\n",
+                dir.path().join("missing.txt").display(),
+                keep.display()
+            ),
+        )
+        .unwrap();
+        let mut args = test_create_args(dir.path().join("out.7z"), vec![]);
+        args.files_from = Some(list.clone());
+        args.files_from_skip_missing = true;
+        let (entries, stats, _) = build_selection(&args).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].archive_name, "keep.txt");
+        assert_eq!(stats.skipped_files_from_missing, 1);
+
+        // Default: hard-fail on missing line.
+        let mut args_hard = test_create_args(dir.path().join("out.7z"), vec![]);
+        args_hard.files_from = Some(list);
+        args_hard.files_from_skip_missing = false;
+        assert!(build_selection(&args_hard).is_err());
     }
 }

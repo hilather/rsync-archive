@@ -389,8 +389,9 @@ Directory walks soft-skip common transient failures (`ENOENT`, `EACCES`, …) so
 broad trees (especially `/`, `/tmp`, or `--include-cwd` when CWD is `/`) does not abort on
 `/proc` races, vanished temp files between readdir and `stat`, or unreadable dirs.
 On Unix, when the walk root is **not** under `/proc`, `/sys`, `/dev`, or `/run`, those
-virtual filesystems are not entered. Explicit `--files-from` paths that are missing
-still error (user-listed path).
+virtual filesystems are not entered. Explicit `--files-from` paths that are missing or
+unreadable **error by default** (user-listed path); pass **`--files-from-skip-missing`** to
+soft-skip those lines instead. See also **Encode soft-skip / live tree races** below.
 
 Walk and `--files-from` select:
 
@@ -420,6 +421,91 @@ Walk and `--files-from` select:
     (`skipped_symlinks` / `skipped_hardlinks`); the first regular-file body for each
     hard-linked inode remains.
 - Dry-run lists only members that the resolved **output format** will archive (after that filter).
+
+---
+
+## Encode soft-skip / live tree races
+
+Create separates **selection** (walk / `--files-from` / filters / budgets) from **encode**
+(open + compress/store each selected member). Live trees can change between those stages
+(temp logs, rotating files, permission races). rsync-archive treats common open-time and
+(where safe) mid-read failures as **soft-skips** or **pad** rather than aborting the whole job.
+
+### What is soft-skipped / padded
+
+| Stage | Behavior | Counter / outcome |
+|-------|----------|-------------------|
+| **Walk / readdir** | `ENOENT`, `EACCES`, `ESTALE` on dirs/files during collection → skip that path (not abort) | walk-time continue / counters |
+| **Open at encode** | Selected regular file vanishes or becomes unreadable (`ENOENT` / `EACCES` / `ESTALE`) → member omitted from archive | `SelectionStats.skipped_vanished` |
+| **Mid-read — 7z** | Skippable I/O after open → **soft-skip** the member with **pack rollback** (sequential stream path truncates partial pack bytes). Parallel 7z encodes each member **to memory first**, then appends only on success — vanish mid-compress soft-skips with no orphan pack. | `skipped_vanished` |
+| **Mid-read — tar / seekable-zstd** | After open, **re-stat** sets the declared size for header/index (not selection size). Early EOF or skippable mid-read → **zero-pad** to the declared size and **warn** (stderr + tracing). Archive stays **structurally valid**; content may be truncated/padded. | member kept (padded); warn |
+| **Size grow (tar / seekable)** | Re-stat after open uses the **actual full size** (not the selection-time cap), so growth between selection and open is archived. | — |
+| **Size shrink after re-stat** | If the file shrinks further **after** the header size is committed (tar/seekable), short read is **zero-padded** (see above). 7z streams actual bytes until EOF / skippable I/O (soft-skip + rollback). | pad or soft-skip |
+
+### Skippable I/O kinds
+
+Soft-skip / pad helpers use `util::is_skippable_fs_io` and `Error::Vanished`:
+
+- **Skippable:** `NotFound`, `PermissionDenied`, `StaleNetworkFileHandle` (and raw `ESTALE` on Unix).
+- **Not soft-skip:** generic timeouts, `InvalidInput`, programmer errors.
+- **`Interrupted` (EINTR):** **not** skippable (`is_skippable_fs_io` returns false). Interrupted syscalls are **retryable**; treating them as vanish/pad would drop or zero-fill content incorrectly. Call sites should **retry** on EINTR rather than skip or fail permanently.
+
+### Per-format encode policy
+
+**All formats — open soft-skip** when the path is inaccessible:
+
+- **7z** (`NonsolidLzma2Writer::push_entry` / parallel `encode_one` / `compress_path_*`): no pack written; continue.
+- **seekable-zstd**: no member header/data; continue.
+- **tar-zstd / tar-lz4**: open **before** parent-dir stubs and file headers for that entry, so a vanished path leaves no orphan header (parent dirs only emitted for surviving members).
+
+**7z mid-read:** sequential path snapshots pack offset, compresses, and on `Error::Vanished` (or other compress failure) **rolls back** the pack stream (`set_len` to pre-member offset) so later members stay consistent. Parallel path never writes pack until compress finishes in RAM.
+
+**tar-zstd / tar-lz4 / seekable-zstd mid-read:** header/index size = post-open re-stat. `stream_reader_exact_or_pad` reads up to that length; shortfall → zeros + soft pad sample (see logging) so tools can list/extract a valid member.
+
+### Soft-skip logging (no spam)
+
+- Per-member soft events use **`tracing` at debug** only (`-v` / `RUST_LOG=debug` for detail).
+- End of create flushes **one compact stderr line per kind**, with up to 5 samples:
+  `skip: vanished 12: a.log, b.log, c.log, d.log, e.log … (+7)`.
+- Kinds: `vanished`, `hardlink`, `padded`, `files-from`, `missing-src`, `config`.
+- Selection summary lists **only non-zero** counters:
+  `create: 100 selected, 3 vanished` (not a long all-zeros line).
+
+### Summary and empty outcomes (`--allow-empty`)
+
+- Create prints `N vanished` in the selection summary when non-zero (write path).
+- If **selection is empty** after filters/limits: error [`EmptyArchive`] unless **`--allow-empty`**.
+- If selection was non-empty but **every** member soft-skipped at encode: error message  
+  `all N selected members vanished or inaccessible at encode` (soft-skip lines + summary first).  
+  With **`--allow-empty`**: exit **0**, **no** `-o` file, warning on stderr.
+- Partial files are cleaned up when nothing is committed.
+
+### `--files-from` (default strict)
+
+Missing or unreadable paths listed in `--files-from` fail at **selection** (user-listed path),
+not at encode soft-skip. Soft-skip applies after a path was successfully selected (e.g. it
+existed at stat time and vanished before open).
+
+With **`--files-from-skip-missing`**, NotFound / PermissionDenied / similar skippable I/O on a
+list line is soft-skipped (`SelectionStats.skipped_files_from_missing`); remaining lines still
+archive. Other errors still abort.
+
+### Multi-SRC missing roots / collisions
+
+Soft-skip does not free a reserved `archive_name` after selection (names are fixed at
+walk). Collisions are still detected at selection. Multi-SRC trees soft-skip independently
+per member at encode.
+
+When **≥2 `SRC...` roots** are given (or SRC combined with `--include-cwd`), a missing or
+inaccessible root is soft-skipped (`SelectionStats.skipped_missing_src`) and other roots are
+still walked. A **single** missing SRC alone is still a hard selection error (misconfiguration).
+
+### Tests
+
+- `tests/e2e_soft_fail_create.rs` — open vanish, unreadable, all-vanished, `--allow-empty`, baselines (7z threads 1/2, tar, seekable).
+- `tests/e2e_soft_fail_7z.rs` — 7z open soft-skip + pack consistency after mid-path skip.
+- `tests/e2e_soft_fail_tar.rs` — tar/seekable vanish, re-stat shrink/grow, pad policy.
+- `tests/e2e_files_from_skip.rs` — `--files-from-skip-missing` and multi-SRC missing-root.
 
 ---
 

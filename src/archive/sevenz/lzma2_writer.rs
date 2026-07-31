@@ -60,74 +60,130 @@ impl NonsolidLzma2Writer {
     }
 
     /// Append using selection metadata (no re-stat). Streams compress → pack.
-    pub fn push_entry(&mut self, entry: &SelectedEntry) -> Result<()> {
+    ///
+    /// Returns `Ok(true)` if a member was written, `Ok(false)` if the source
+    /// vanished/became inaccessible and was soft-skipped (no orphan pack bytes).
+    ///
+    /// Zero-byte selected files still open the path so a vanish race soft-skips
+    /// (no phantom empty member).
+    pub fn push_entry(&mut self, entry: &SelectedEntry) -> Result<bool> {
         let mtime = entry
             .mtime_unix
             .map(super::header::filetime_from_unix_secs);
+
+        // EINTR is retried inside open_file_for_encode (not soft-skipped).
+        let mut input = match crate::util::open_file_for_encode(&entry.abs_path) {
+            Ok(f) => f,
+            Err(Error::Vanished(_)) => {
+                crate::util::soft_skip_note(
+                    crate::util::SoftKind::Vanished,
+                    &entry.archive_name,
+                );
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        };
 
         if entry.size == 0 {
             let mut hf = HeaderFile::empty_file(entry.archive_name.clone());
             hf.mtime = mtime;
             self.files.push(hf);
-            return Ok(());
+            return Ok(true);
         }
 
-        let mut input = match File::open(&entry.abs_path) {
-            Ok(f) => f,
-            Err(e) if crate::util::is_skippable_fs_io(&e) => {
-                tracing::warn!(
-                    path = %entry.abs_path.display(),
-                    name = %entry.archive_name,
-                    error = %e,
-                    "skip vanished or inaccessible file at open"
-                );
-                return Ok(());
-            }
-            Err(e) => {
-                return Err(Error::Archive(format!(
-                    "open {}: {e}",
-                    entry.abs_path.display()
-                )));
-            }
-        };
         let zstd_w = if self.method == CompressMethod::Zstd {
             self.zstd_nb_workers
         } else {
             0
         };
-        let (props, content_crc, unpack_size, pack_crc, pack_size) =
-            compress_reader_append_pack_sized(
-                &mut input,
-                self.method,
-                self.level,
-                Some(entry.size),
-                zstd_w,
-                &mut self.file,
-            )?;
 
-        if unpack_size == 0 && pack_size == 0 {
-            let mut hf = HeaderFile::empty_file(entry.archive_name.clone());
-            hf.mtime = mtime;
-            self.files.push(hf);
-            return Ok(());
-        }
-
-        self.files.push(HeaderFile {
-            name: entry.archive_name.clone(),
-            pack_size,
-            pack_crc,
-            unpack_size,
-            content_crc,
-            method_id: self.method.method_id().to_vec(),
-            method_props: props,
-            empty: false,
+        self.push_opened_reader(
+            &entry.archive_name,
+            entry.size,
+            &mut input,
+            &entry.abs_path,
             mtime,
-        });
+            zstd_w,
+        )
+    }
+
+    /// Compress from an already-opened reader (pack path). Soft-skips on
+    /// [`Error::Vanished`] with pack rollback so neighbors stay consistent.
+    ///
+    /// Used by [`push_entry`] and by unit tests injecting mid-read failures.
+    pub(crate) fn push_opened_reader(
+        &mut self,
+        archive_name: &str,
+        size: u64,
+        input: &mut dyn std::io::Read,
+        src_path: &Path,
+        mtime: Option<u64>,
+        zstd_nb_workers: u32,
+    ) -> Result<bool> {
+        // Snapshot pack offset so a mid-compress failure can roll back orphan bytes.
+        self.file.flush().map_err(Error::Io)?;
+        let pack_start = self.file.get_mut().stream_position().map_err(Error::Io)?;
+
+        let compress_result = compress_reader_append_pack_sized(
+            input,
+            self.method,
+            self.level,
+            Some(size),
+            zstd_nb_workers,
+            &mut self.file,
+            Some(src_path),
+        );
+
+        match compress_result {
+            Ok((props, content_crc, unpack_size, pack_crc, pack_size)) => {
+                if unpack_size == 0 && pack_size == 0 {
+                    let mut hf = HeaderFile::empty_file(archive_name.to_string());
+                    hf.mtime = mtime;
+                    self.files.push(hf);
+                    return Ok(true);
+                }
+
+                self.files.push(HeaderFile {
+                    name: archive_name.to_string(),
+                    pack_size,
+                    pack_crc,
+                    unpack_size,
+                    content_crc,
+                    method_id: self.method.method_id().to_vec(),
+                    method_props: props,
+                    empty: false,
+                    mtime,
+                });
+                Ok(true)
+            }
+            Err(Error::Vanished(_)) => {
+                self.rollback_pack(pack_start)?;
+                crate::util::soft_skip_note(crate::util::SoftKind::Vanished, archive_name);
+                Ok(false)
+            }
+            Err(e) => {
+                // Any compress failure may have written partial pack data — roll back
+                // before re-raising so the next member (or finish) stays consistent.
+                self.rollback_pack(pack_start)?;
+                Err(e)
+            }
+        }
+    }
+
+    /// Truncate the pack stream back to `pack_start` (after a failed/soft-skipped member).
+    fn rollback_pack(&mut self, pack_start: u64) -> Result<()> {
+        // Flush so BufWriter buffer is empty; then seek+truncate the underlying file.
+        self.file.flush().map_err(Error::Io)?;
+        let f = self.file.get_mut();
+        f.seek(SeekFrom::Start(pack_start)).map_err(Error::Io)?;
+        f.set_len(pack_start).map_err(Error::Io)?;
         Ok(())
     }
 
     /// Append a source file by path (re-stats; prefer [`push_entry`]).
-    pub fn push_path(&mut self, name: String, src: &Path) -> Result<()> {
+    ///
+    /// Returns `Ok(true)` if written, `Ok(false)` if soft-skipped (vanished).
+    pub fn push_path(&mut self, name: String, src: &Path) -> Result<bool> {
         let meta = std::fs::symlink_metadata(src).map_err(|e| {
             Error::Archive(format!("stat {} for create: {e}", src.display()))
         })?;
@@ -285,5 +341,280 @@ mod tests {
         let out = dir.path().join("empty.7z");
         let w = NonsolidLzma2Writer::create(&out, 1).unwrap();
         assert!(matches!(w.finish().unwrap_err(), Error::EmptyArchive));
+    }
+
+    fn entry_for(path: &Path, name: &str, size: u64) -> SelectedEntry {
+        SelectedEntry {
+            abs_path: path.to_path_buf(),
+            archive_name: name.into(),
+            size,
+            mtime_unix: None,
+            mode: crate::select::DEFAULT_FILE_MODE,
+            uid: 0,
+            gid: 0,
+            uname: String::new(),
+            gname: String::new(),
+            kind: crate::select::MemberKind::File,
+        }
+    }
+
+    #[test]
+    fn open_time_vanish_soft_skips_keeps_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        let c = dir.path().join("c.txt");
+        fs::write(&a, b"alpha").unwrap();
+        fs::write(&b, b"bravo-will-vanish").unwrap();
+        fs::write(&c, b"charlie").unwrap();
+
+        let out = dir.path().join("out.7z");
+        let mut w = NonsolidLzma2Writer::create(&out, 1).unwrap();
+        assert!(w.push_entry(&entry_for(&a, "a.txt", 5)).unwrap());
+        // Delete after selection-style entry is built; open soft-skips.
+        fs::remove_file(&b).unwrap();
+        assert!(!w
+            .push_entry(&entry_for(&b, "b.txt", 17))
+            .unwrap());
+        assert!(w.push_entry(&entry_for(&c, "c.txt", 7)).unwrap());
+        w.finish().unwrap();
+
+        assert_eq!(extract(&out, "a.txt"), b"alpha");
+        assert_eq!(extract(&out, "c.txt"), b"charlie");
+        let reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+        let names: Vec<_> = reader
+            .archive()
+            .files
+            .iter()
+            .filter(|e| !e.is_directory())
+            .map(|e| e.name().to_string())
+            .collect();
+        assert_eq!(names, vec!["a.txt".to_string(), "c.txt".to_string()]);
+    }
+
+    #[test]
+    fn soft_skip_methods_zstd_lz4() {
+        for method in [CompressMethod::Zstd, CompressMethod::Lz4] {
+            let dir = tempfile::tempdir().unwrap();
+            let good = dir.path().join("good.txt");
+            let gone = dir.path().join("gone.txt");
+            fs::write(&good, b"keep-me").unwrap();
+            fs::write(&gone, b"delete-me").unwrap();
+            let out = dir.path().join("m.7z");
+            let mut w =
+                NonsolidLzma2Writer::create_with_method(&out, 1, method).unwrap();
+            assert!(w.push_entry(&entry_for(&good, "good.txt", 7)).unwrap());
+            fs::remove_file(&gone).unwrap();
+            assert!(!w
+                .push_entry(&entry_for(&gone, "gone.txt", 9))
+                .unwrap());
+            w.finish().unwrap();
+            assert_eq!(extract(&out, "good.txt"), b"keep-me");
+        }
+    }
+
+    #[test]
+    fn all_vanished_yields_empty_archive_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone.txt");
+        fs::write(&gone, b"x").unwrap();
+        let out = dir.path().join("empty.7z");
+        let mut w = NonsolidLzma2Writer::create(&out, 1).unwrap();
+        fs::remove_file(&gone).unwrap();
+        assert!(!w.push_entry(&entry_for(&gone, "gone.txt", 1)).unwrap());
+        assert!(matches!(w.finish().unwrap_err(), Error::EmptyArchive));
+    }
+
+    /// T1: zero-byte file deleted before encode must soft-skip (no phantom empty).
+    #[test]
+    fn zero_byte_vanish_soft_skips_no_phantom_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.dat");
+        let keep = dir.path().join("keep.txt");
+        fs::write(&empty, b"").unwrap();
+        fs::write(&keep, b"neighbor").unwrap();
+
+        let out = dir.path().join("out.7z");
+        let mut w = NonsolidLzma2Writer::create(&out, 1).unwrap();
+        fs::remove_file(&empty).unwrap();
+        assert!(
+            !w.push_entry(&entry_for(&empty, "empty.dat", 0)).unwrap(),
+            "vanished zero-byte must soft-skip, not write phantom empty"
+        );
+        assert!(w.push_entry(&entry_for(&keep, "keep.txt", 8)).unwrap());
+        w.finish().unwrap();
+
+        assert_eq!(extract(&out, "keep.txt"), b"neighbor");
+        let reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+        let names: Vec<_> = reader
+            .archive()
+            .files
+            .iter()
+            .filter(|e| !e.is_directory())
+            .map(|e| e.name().to_string())
+            .collect();
+        assert_eq!(names, vec!["keep.txt".to_string()]);
+        assert!(!names.iter().any(|n| n.contains("empty")));
+    }
+
+    /// Zero-byte file that still exists is archived as empty.
+    #[test]
+    fn zero_byte_present_writes_empty_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.dat");
+        fs::write(&empty, b"").unwrap();
+        let out = dir.path().join("out.7z");
+        let mut w = NonsolidLzma2Writer::create(&out, 1).unwrap();
+        assert!(w.push_entry(&entry_for(&empty, "empty.dat", 0)).unwrap());
+        w.finish().unwrap();
+        let reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+        let names: Vec<_> = reader
+            .archive()
+            .files
+            .iter()
+            .filter(|e| !e.is_directory())
+            .map(|e| e.name().to_string())
+            .collect();
+        assert_eq!(names, vec!["empty.dat".to_string()]);
+        assert_eq!(extract(&out, "empty.dat"), b"");
+    }
+
+    /// T3: mid-read skippable I/O → Vanished soft-skip + pack rollback; neighbor ok.
+    #[test]
+    fn mid_read_soft_skip_rolls_back_keeps_neighbors() {
+        use std::io::Read;
+
+        struct FailAfter {
+            data: Vec<u8>,
+            pos: usize,
+            fail_at: usize,
+            kind: std::io::ErrorKind,
+        }
+        impl Read for FailAfter {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos >= self.fail_at {
+                    return Err(std::io::Error::new(self.kind, "injected mid-read"));
+                }
+                let remain = self
+                    .fail_at
+                    .saturating_sub(self.pos)
+                    .min(self.data.len().saturating_sub(self.pos));
+                let n = remain.min(buf.len());
+                if n == 0 {
+                    return Ok(0);
+                }
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let c = dir.path().join("c.txt");
+        fs::write(&a, b"alpha").unwrap();
+        fs::write(&c, b"charlie").unwrap();
+        let out = dir.path().join("mid.7z");
+        let mut w = NonsolidLzma2Writer::create(&out, 1).unwrap();
+        assert!(w.push_entry(&entry_for(&a, "a.txt", 5)).unwrap());
+
+        let payload = b"partial payload that is long enough to stream".repeat(200);
+        let mut bad = FailAfter {
+            data: payload.clone(),
+            pos: 0,
+            fail_at: 64,
+            kind: std::io::ErrorKind::NotFound,
+        };
+        let fake = dir.path().join("vanished-mid.bin");
+        assert!(
+            !w.push_opened_reader(
+                "vanished-mid.bin",
+                payload.len() as u64,
+                &mut bad,
+                &fake,
+                None,
+                0,
+            )
+            .unwrap(),
+            "mid-read NotFound must soft-skip"
+        );
+
+        assert!(w.push_entry(&entry_for(&c, "c.txt", 7)).unwrap());
+        w.finish().unwrap();
+
+        assert_eq!(extract(&out, "a.txt"), b"alpha");
+        assert_eq!(extract(&out, "c.txt"), b"charlie");
+        let reader = ArchiveReader::open(&out, Password::empty()).unwrap();
+        let names: Vec<_> = reader
+            .archive()
+            .files
+            .iter()
+            .filter(|e| !e.is_directory())
+            .map(|e| e.name().to_string())
+            .collect();
+        assert_eq!(names, vec!["a.txt".to_string(), "c.txt".to_string()]);
+    }
+
+    /// T3: mid-read PermissionDenied also soft-skips with rollback.
+    #[test]
+    fn mid_read_permission_denied_soft_skips() {
+        use std::io::Read;
+
+        struct FailAfter {
+            data: Vec<u8>,
+            pos: usize,
+            fail_at: usize,
+        }
+        impl Read for FailAfter {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.pos >= self.fail_at {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "eacces",
+                    ));
+                }
+                let remain = self
+                    .fail_at
+                    .saturating_sub(self.pos)
+                    .min(self.data.len().saturating_sub(self.pos));
+                let n = remain.min(buf.len());
+                if n == 0 {
+                    return Ok(0);
+                }
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let keep = dir.path().join("keep.txt");
+        fs::write(&keep, b"ok").unwrap();
+        let out = dir.path().join("eacces.7z");
+        let mut w = NonsolidLzma2Writer::create_with_method(
+            &out,
+            1,
+            CompressMethod::Zstd,
+        )
+        .unwrap();
+        let data = b"z".repeat(4096);
+        let mut bad = FailAfter {
+            data: data.clone(),
+            pos: 0,
+            fail_at: 100,
+        };
+        assert!(!w
+            .push_opened_reader(
+                "denied.bin",
+                data.len() as u64,
+                &mut bad,
+                Path::new("/unreadable"),
+                None,
+                0,
+            )
+            .unwrap());
+        assert!(w.push_entry(&entry_for(&keep, "keep.txt", 2)).unwrap());
+        w.finish().unwrap();
+        assert_eq!(extract(&out, "keep.txt"), b"ok");
     }
 }

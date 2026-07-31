@@ -157,10 +157,10 @@ pub fn compress_path_with_size(
     zstd_nb_workers: u32,
 ) -> Result<CompressedPack> {
     let size = known_size.or_else(|| std::fs::metadata(path).ok().map(|m| m.len()));
-    // Small-file fast path: one read + bulk compress.
+    // Small-file fast path: one read + bulk compress (retry EINTR).
     if let Some(sz) = size {
         if sz > 0 && sz <= SMALL_FILE_ONESHOT {
-            let data = match std::fs::read(path) {
+            let data = match crate::util::retry_interrupted(|| std::fs::read(path)) {
                 Ok(d) => d,
                 Err(e) if crate::util::is_skippable_fs_io(&e) => {
                     return Err(Error::Vanished(path.to_path_buf()));
@@ -175,19 +175,10 @@ pub fn compress_path_with_size(
             return compress_bytes_inner(&data, method, level, zstd_nb_workers);
         }
     }
-    let mut f = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if crate::util::is_skippable_fs_io(&e) => {
-            return Err(Error::Vanished(path.to_path_buf()));
-        }
-        Err(e) => {
-            return Err(Error::Archive(format!(
-                "open {} for compress: {e}",
-                path.display()
-            )));
-        }
-    };
-    compress_reader_sized(&mut f, method, level, size, zstd_nb_workers)
+    // EINTR retried; skippable open → Vanished (not soft-skip via Interrupted).
+    let mut f = crate::util::open_file_for_encode(path)?;
+    // Mid-read ENOENT/EACCES/ESTALE → Vanished so create can soft-skip the member.
+    compress_reader_sized_path(&mut f, method, level, size, zstd_nb_workers, Some(path))
 }
 
 /// Stream-read `reader` into an in-memory compressed pack.
@@ -208,7 +199,7 @@ fn compress_bytes_inner(
     let mut out = Vec::with_capacity(input.len() / 2 + 64);
     let (props, content_crc, unpack_size) = match method {
         CompressMethod::Lzma2 => {
-            compress_lzma2(&mut &input[..], level, Some(input.len() as u64), &mut out)?
+            compress_lzma2(&mut &input[..], level, Some(input.len() as u64), &mut out, None)?
         }
         CompressMethod::Zstd => compress_zstd(
             &mut &input[..],
@@ -216,8 +207,9 @@ fn compress_bytes_inner(
             Some(input.len() as u64),
             zstd_nb_workers,
             &mut out,
+            None,
         )?,
-        CompressMethod::Lz4 => compress_lz4(&mut &input[..], level, &mut out)?,
+        CompressMethod::Lz4 => compress_lz4(&mut &input[..], level, &mut out, None)?,
     };
     let pack_crc = crc32fast::hash(&out);
     Ok(CompressedPack {
@@ -237,12 +229,30 @@ fn compress_reader_sized(
     known_size: Option<u64>,
     zstd_nb_workers: u32,
 ) -> Result<CompressedPack> {
+    compress_reader_sized_path(reader, method, level, known_size, zstd_nb_workers, None)
+}
+
+fn compress_reader_sized_path(
+    reader: &mut dyn Read,
+    method: CompressMethod,
+    level: u32,
+    known_size: Option<u64>,
+    zstd_nb_workers: u32,
+    path: Option<&Path>,
+) -> Result<CompressedPack> {
     let cap = known_size
         .map(|s| (s / 2).saturating_add(64) as usize)
         .unwrap_or(64 * 1024);
     let mut out = Vec::with_capacity(cap);
-    let (props, content_crc, unpack_size) =
-        compress_reader_to_writer_sized(reader, method, level, known_size, zstd_nb_workers, &mut out)?;
+    let (props, content_crc, unpack_size) = compress_reader_to_writer_sized(
+        reader,
+        method,
+        level,
+        known_size,
+        zstd_nb_workers,
+        &mut out,
+        path,
+    )?;
     let pack_crc = crc32fast::hash(&out);
     Ok(CompressedPack {
         data: out,
@@ -261,7 +271,7 @@ pub fn compress_reader_to_writer(
     level: u32,
     pack_out: &mut dyn Write,
 ) -> Result<(Vec<u8>, u32, u64)> {
-    compress_reader_to_writer_sized(reader, method, level, None, 0, pack_out)
+    compress_reader_to_writer_sized(reader, method, level, None, 0, pack_out, None)
 }
 
 fn compress_reader_to_writer_sized(
@@ -271,13 +281,14 @@ fn compress_reader_to_writer_sized(
     known_size: Option<u64>,
     zstd_nb_workers: u32,
     pack_out: &mut dyn Write,
+    path: Option<&Path>,
 ) -> Result<(Vec<u8>, u32, u64)> {
     match method {
-        CompressMethod::Lzma2 => compress_lzma2(reader, level, known_size, pack_out),
+        CompressMethod::Lzma2 => compress_lzma2(reader, level, known_size, pack_out, path),
         CompressMethod::Zstd => {
-            compress_zstd(reader, level, known_size, zstd_nb_workers, pack_out)
+            compress_zstd(reader, level, known_size, zstd_nb_workers, pack_out, path)
         }
-        CompressMethod::Lz4 => compress_lz4(reader, level, pack_out),
+        CompressMethod::Lz4 => compress_lz4(reader, level, pack_out, path),
     }
 }
 
@@ -290,10 +301,12 @@ pub fn compress_reader_append_pack(
     level: u32,
     pack_out: &mut dyn Write,
 ) -> Result<(Vec<u8>, u32, u64, u32, u64)> {
-    compress_reader_append_pack_sized(reader, method, level, None, 0, pack_out)
+    compress_reader_append_pack_sized(reader, method, level, None, 0, pack_out, None)
 }
 
 /// Like [`compress_reader_append_pack`] with known size and zstd workers.
+///
+/// When `path` is set, skippable mid-read I/O becomes [`Error::Vanished`].
 pub fn compress_reader_append_pack_sized(
     reader: &mut dyn Read,
     method: CompressMethod,
@@ -301,6 +314,7 @@ pub fn compress_reader_append_pack_sized(
     known_size: Option<u64>,
     zstd_nb_workers: u32,
     pack_out: &mut dyn Write,
+    path: Option<&Path>,
 ) -> Result<(Vec<u8>, u32, u64, u32, u64)> {
     let mut pack = PackCrcWriter::new(pack_out);
     let (props, content_crc, unpack_size) = compress_reader_to_writer_sized(
@@ -310,6 +324,7 @@ pub fn compress_reader_append_pack_sized(
         known_size,
         zstd_nb_workers,
         &mut pack,
+        path,
     )?;
     let (pack_crc, pack_size) = pack.into_crc_and_size();
     Ok((props, content_crc, unpack_size, pack_crc, pack_size))
@@ -320,6 +335,7 @@ fn compress_lzma2(
     level: u32,
     known_size: Option<u64>,
     pack_out: &mut dyn Write,
+    path: Option<&Path>,
 ) -> Result<(Vec<u8>, u32, u64)> {
     let level = level.min(9);
     let dict = lzma2_dict_for(level, known_size);
@@ -336,6 +352,7 @@ fn compress_lzma2(
             pack_out,
             &mut content_hasher,
             &mut unpack_size,
+            path,
         )?;
         return Ok((props, content_hasher.finalize(), unpack_size));
     }
@@ -349,6 +366,7 @@ fn compress_lzma2(
             pack_out,
             &mut content_hasher,
             &mut unpack_size,
+            path,
         )?;
         Ok((props, content_hasher.finalize(), unpack_size))
     }
@@ -362,13 +380,14 @@ fn compress_lzma2_rust(
     pack_out: &mut dyn Write,
     content_hasher: &mut crc32fast::Hasher,
     unpack_size: &mut u64,
+    path: Option<&Path>,
 ) -> Result<()> {
     use lzma_rust2::{Lzma2Options, Lzma2Writer};
     let mut opt = Lzma2Options::with_preset(level);
     opt.chunk_size = None;
     opt.lzma_options.dict_size = dict;
     let mut enc = Lzma2Writer::new(CountingWrite::new(pack_out), opt);
-    copy_hashed(reader, &mut enc, content_hasher, unpack_size)?;
+    copy_hashed_path(reader, &mut enc, content_hasher, unpack_size, path)?;
     enc.finish()
         .map_err(|e| Error::Compress(format!("LZMA2 finish: {e}")))?;
     Ok(())
@@ -384,6 +403,7 @@ fn compress_lzma2_liblzma(
     pack_out: &mut dyn Write,
     content_hasher: &mut crc32fast::Hasher,
     unpack_size: &mut u64,
+    path: Option<&Path>,
 ) -> Result<()> {
     use liblzma::stream::{Filters, LzmaOptions, Stream};
     use liblzma::write::XzEncoder;
@@ -397,17 +417,19 @@ fn compress_lzma2_liblzma(
     let stream = Stream::new_raw_encoder(&filters)
         .map_err(|e| Error::Compress(format!("liblzma raw LZMA2 encoder: {e:?}")))?;
     let mut enc = XzEncoder::new_stream(CountingWrite::new(pack_out), stream);
-    copy_hashed(reader, &mut enc, content_hasher, unpack_size)?;
+    copy_hashed_path(reader, &mut enc, content_hasher, unpack_size, path)?;
     enc.finish()
         .map_err(|e| Error::Compress(format!("liblzma LZMA2 finish: {e}")))?;
     Ok(())
 }
+
 fn compress_zstd(
     reader: &mut dyn Read,
     level: u32,
     known_size: Option<u64>,
     zstd_nb_workers: u32,
     pack_out: &mut dyn Write,
+    path: Option<&Path>,
 ) -> Result<(Vec<u8>, u32, u64)> {
     let zlevel = zstd_level(level);
     // 7z ZSTD props: major, minor, level (matches sevenz-rust2)
@@ -424,10 +446,8 @@ fn compress_zstd(
         // 7z already stores content CRC — skip redundant frame XXH64.
         enc.include_checksum(false)
             .map_err(|e| Error::Compress(format!("zstd checksum: {e}")))?;
-        if let Some(sz) = known_size {
-            enc.set_pledged_src_size(Some(sz))
-                .map_err(|e| Error::Compress(format!("zstd pledged size: {e}")))?;
-        }
+        // Do not pledge size: source files may shrink between stat and EOF; actual
+        // bytes read become unpack_size (soft shrink is OK for create).
         // OPT-11: intra-frame MT only for large members when requested (`zstdmt` feature).
         if zstd_nb_workers > 1 {
             if let Some(sz) = known_size {
@@ -437,7 +457,7 @@ fn compress_zstd(
                 }
             }
         }
-        copy_hashed(reader, &mut enc, &mut content_hasher, &mut unpack_size)?;
+        copy_hashed_path(reader, &mut enc, &mut content_hasher, &mut unpack_size, path)?;
         enc.finish()
             .map_err(|e| Error::Compress(format!("zstd finish: {e}")))?;
     }
@@ -448,6 +468,7 @@ fn compress_lz4(
     reader: &mut dyn Read,
     level: u32,
     pack_out: &mut dyn Write,
+    path: Option<&Path>,
 ) -> Result<(Vec<u8>, u32, u64)> {
     // Props: major=1, minor=0, level byte (1–12 for peer parity with 7zz-zstd).
     let props = vec![1u8, 0u8, lz4_level_byte(level)];
@@ -462,13 +483,14 @@ fn compress_lz4(
             pack_out,
             &mut content_hasher,
             &mut unpack_size,
+            path,
         )?;
         return Ok((props, content_hasher.finalize(), unpack_size));
     }
 
     // Fast path: pure-Rust lz4_flex frames (levels 1–2, or all levels without lz4-hc).
     let mut enc = lz4_flex::frame::FrameEncoder::new(CountingWrite::new(pack_out));
-    copy_hashed(reader, &mut enc, &mut content_hasher, &mut unpack_size)?;
+    copy_hashed_path(reader, &mut enc, &mut content_hasher, &mut unpack_size, path)?;
     enc.finish()
         .map_err(|e| Error::Compress(format!("lz4 finish: {e}")))?;
     Ok((props, content_hasher.finalize(), unpack_size))
@@ -482,6 +504,7 @@ fn compress_lz4_hc(
     pack_out: &mut dyn Write,
     content_hasher: &mut crc32fast::Hasher,
     unpack_size: &mut u64,
+    path: Option<&Path>,
 ) -> Result<()> {
     let hc = lz4_hc_compression_level(level);
     let mut enc = lz4::EncoderBuilder::new()
@@ -492,20 +515,35 @@ fn compress_lz4_hc(
         .checksum(lz4::ContentChecksum::NoChecksum)
         .build(CountingWrite::new(pack_out))
         .map_err(|e| Error::Compress(format!("lz4-hc encoder: {e}")))?;
-    copy_hashed(reader, &mut enc, content_hasher, unpack_size)?;
+    copy_hashed_path(reader, &mut enc, content_hasher, unpack_size, path)?;
     let (_w, res) = enc.finish();
     res.map_err(|e| Error::Compress(format!("lz4-hc finish: {e}")))?;
     Ok(())
 }
-fn copy_hashed(
+
+/// Like [`copy_hashed`], but maps skippable read errors to [`Error::Vanished`] when `path` is set.
+///
+/// Retries on `EINTR` ([`std::io::ErrorKind::Interrupted`]) via
+/// [`crate::util::read_retrying`]; Interrupted is **not** a soft-skip kind.
+pub fn copy_hashed_path(
     reader: &mut dyn Read,
     writer: &mut dyn Write,
     content_hasher: &mut crc32fast::Hasher,
     unpack_size: &mut u64,
+    path: Option<&Path>,
 ) -> Result<()> {
     let mut buf = [0u8; 256 * 1024];
     loop {
-        let n = reader.read(&mut buf).map_err(Error::Io)?;
+        let n = match crate::util::read_retrying(reader, &mut buf) {
+            Ok(n) => n,
+            Err(e) if crate::util::is_skippable_fs_io(&e) => {
+                return Err(match path {
+                    Some(p) => Error::Vanished(p.to_path_buf()),
+                    None => Error::Io(e),
+                });
+            }
+            Err(e) => return Err(Error::Io(e)),
+        };
         if n == 0 {
             break;
         }
@@ -731,4 +769,195 @@ mod tests {
         let dict = dict_size_for_member(5, msg.len() as u64);
         assert_eq!(decode_lzma2(&out.data, dict), msg);
     }
+
+    /// Reader that fails mid-stream with a skippable I/O error.
+    struct FailAfter {
+        data: Vec<u8>,
+        pos: usize,
+        fail_at: usize,
+        kind: std::io::ErrorKind,
+    }
+
+    impl Read for FailAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.fail_at {
+                return Err(std::io::Error::new(self.kind, "injected mid-read fail"));
+            }
+            let remain = self.fail_at.saturating_sub(self.pos).min(self.data.len().saturating_sub(self.pos));
+            let n = remain.min(buf.len());
+            if n == 0 {
+                return Ok(0);
+            }
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn mid_read_not_found_maps_to_vanished_when_path_set() {
+        let data = b"partial payload that is long enough to stream".repeat(200);
+        let mut r = FailAfter {
+            data: data.clone(),
+            pos: 0,
+            fail_at: 64,
+            kind: std::io::ErrorKind::NotFound,
+        };
+        let path = Path::new("/tmp/vanished-member.bin");
+        let err = compress_reader_sized_path(
+            &mut r,
+            CompressMethod::Lzma2,
+            1,
+            Some(data.len() as u64),
+            0,
+            Some(path),
+        )
+        .unwrap_err();
+        match err {
+            Error::Vanished(p) => assert_eq!(p, path),
+            other => panic!("expected Vanished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mid_read_permission_denied_maps_to_vanished() {
+        let data = b"x".repeat(4096);
+        let mut r = FailAfter {
+            data: data.clone(),
+            pos: 0,
+            fail_at: 100,
+            kind: std::io::ErrorKind::PermissionDenied,
+        };
+        let path = Path::new("/unreadable/file");
+        let err = compress_reader_append_pack_sized(
+            &mut r,
+            CompressMethod::Zstd,
+            1,
+            Some(data.len() as u64),
+            0,
+            &mut Vec::new(),
+            Some(path),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Vanished(_)), "{err:?}");
+    }
+
+    #[test]
+    fn mid_read_skippable_without_path_stays_io() {
+        let data = b"y".repeat(2048);
+        let mut r = FailAfter {
+            data: data.clone(),
+            pos: 0,
+            fail_at: 50,
+            kind: std::io::ErrorKind::NotFound,
+        };
+        let err = compress_reader_sized(&mut r, CompressMethod::Lz4, 1, Some(data.len() as u64), 0)
+            .unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+    }
+
+    /// T5: Interrupted is not soft-skip; copy_hashed_path retries then continues.
+    #[test]
+    fn mid_read_interrupted_retries_and_succeeds() {
+        struct InterruptThenData {
+            interrupts_left: usize,
+            data: Vec<u8>,
+            pos: usize,
+        }
+        impl Read for InterruptThenData {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.interrupts_left > 0 {
+                    self.interrupts_left -= 1;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "eintr",
+                    ));
+                }
+                if self.pos >= self.data.len() {
+                    return Ok(0);
+                }
+                let n = (self.data.len() - self.pos).min(buf.len());
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        let msg = b"eintr-retry-payload-ok";
+        let mut r = InterruptThenData {
+            interrupts_left: 5,
+            data: msg.to_vec(),
+            pos: 0,
+        };
+        let out = compress_reader_sized(
+            &mut r,
+            CompressMethod::Lzma2,
+            1,
+            Some(msg.len() as u64),
+            0,
+        )
+        .expect("Interrupted must be retried, not soft-skipped or failed");
+        assert_eq!(out.uncompressed_size, msg.len() as u64);
+        let dict = dict_size_for_member(1, msg.len() as u64);
+        assert_eq!(decode_lzma2(&out.data, dict), msg);
+    }
+
+    /// T5: Interrupted with path set is still not Vanished (retry, not soft-skip).
+    #[test]
+    fn interrupted_not_mapped_to_vanished() {
+        // After retries would succeed; pure Interrupted-only reader that never
+        // delivers data is not expected (retry loops forever on pure EINTR).
+        // Instead: inject Interrupted then NotFound — after retry, NotFound → Vanished.
+        struct EintrThenNotFound {
+            phase: u8,
+        }
+        impl Read for EintrThenNotFound {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.phase == 0 {
+                    self.phase = 1;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "eintr",
+                    ));
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "gone",
+                ))
+            }
+        }
+        let mut r = EintrThenNotFound { phase: 0 };
+        let path = Path::new("/tmp/x");
+        let err = compress_reader_sized_path(
+            &mut r,
+            CompressMethod::Zstd,
+            1,
+            Some(100),
+            0,
+            Some(path),
+        )
+        .unwrap_err();
+        // First EINTR retried; then NotFound → Vanished.
+        assert!(matches!(err, Error::Vanished(_)), "{err:?}");
+    }
+
+    #[test]
+    fn size_shrink_uses_actual_bytes_as_unpack_size() {
+        // Reader EOF before known_size: must succeed with actual length (no hard-fail).
+        let msg = b"shrunk content only";
+        let mut cursor = Cursor::new(&msg[..]);
+        let out = compress_reader_sized(
+            &mut cursor,
+            CompressMethod::Lzma2,
+            1,
+            Some(10_000), // claimed larger than actual
+            0,
+        )
+        .unwrap();
+        assert_eq!(out.uncompressed_size, msg.len() as u64);
+        let dict = dict_size_for_member(1, 10_000);
+        // Decode may use prop from actual encode dict clamp with known_size 10000.
+        assert_eq!(decode_lzma2(&out.data, dict), msg);
+    }
+
 }
