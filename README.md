@@ -1,5 +1,8 @@
 <div align="center">
 
+<!-- Social / hero banner -->
+![rsync-archive](docs/assets/social-preview.png)
+
 # rsync-archive
 
 ### Stream-create random-access archives with rsync-grade path selection
